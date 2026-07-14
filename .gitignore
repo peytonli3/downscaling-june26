@@ -20,3 +20,6 @@ data/
 # Python caches
 __pycache__/
 *.pyc
+
+# On-disk archive of dead artifacts (recoverable code is in git tags)
+_archive/
