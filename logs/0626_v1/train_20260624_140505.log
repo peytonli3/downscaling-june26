@@ -1,0 +1,63 @@
+2026-06-24 14:05:05,250 INFO Logging to /home/peytonli/26.6_wind/logs/train_20260624_140505.log
+2026-06-24 14:05:05,251 INFO Config:
+{
+  "seed": 0,
+  "paths": {
+    "data_dir": "/home/peytonli/26.6_wind/data",
+    "log_dir": "/home/peytonli/26.6_wind/logs",
+    "splits_path": "/home/peytonli/26.6_wind/data/splits_70_15_15/split_indices.npz"
+  },
+  "model": {
+    "img_size": 200,
+    "embed_dim": 96,
+    "depths": [
+      4,
+      4,
+      4
+    ],
+    "num_heads": [
+      6,
+      6,
+      6
+    ],
+    "window_size": 8,
+    "mlp_ratio": 4.0,
+    "head_init_std": 0.001,
+    "chol_diag_init": 1.0
+  },
+  "training": {
+    "batch_size": 4,
+    "num_epochs": 100,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.0,
+    "nll_weight": 0.5,
+    "l1_weight": 1.0,
+    "spectral_weight": 0.258,
+    "gradient_weight": 0.003,
+    "quantile_weight": 0.241,
+    "spectral_low_freq_cutoff": 0.28,
+    "quantiles": [
+      0.95,
+      0.99
+    ],
+    "grad_clip_norm": 1.0,
+    "num_workers": 2,
+    "val_interval": 1,
+    "lr_milestone_fractions": [
+      0.5,
+      0.75,
+      0.9
+    ],
+    "lr_gamma": 0.5
+  },
+  "logging": {
+    "log_every": 50
+  }
+}
+2026-06-24 14:05:05,251 INFO Using device: cuda
+2026-06-24 14:05:05,253 INFO Train samples: 4744, Val samples: 1013
+2026-06-24 14:05:05,557 INFO Total parameters: 2093381
+2026-06-24 14:05:05,558 INFO LR schedule: milestones (steps) = [59300, 88950, 106740] (of 118600 total), gamma = 0.500
+2026-06-24 14:05:05,559 INFO Loss weights: {'nll': 0.5, 'l1': 1.0, 'spectral': 0.258, 'gradient': 0.003, 'quantile': 0.241}
+2026-06-24 14:05:05,559 INFO Mean-aux loss params: spectral_low_freq_cutoff=0.280, quantiles=[0.95, 0.99]
+2026-06-24 14:05:38,846 INFO Epoch 0 | Batch 50/1186 | Loss 5.03931 (NLL 5.62527 [logdet 1.47196, mahal 2.31544], L1 1.94456, Spectral 0.26718, Gradient 0.46771, Quantile 0.87875) | LR 1.00e-04

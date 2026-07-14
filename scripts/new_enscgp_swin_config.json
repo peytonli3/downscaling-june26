@@ -1,0 +1,67 @@
+{
+  "seed": 0,
+  "paths": {
+    "data_dir": "/home/peytonli/26.6_wind/data",
+    "log_dir": "/home/peytonli/26.6_wind/logs/0701",
+    "splits_path": "/home/peytonli/26.6_wind/data/splits_70_15_15/split_indices.npz"
+  },
+  "model": {
+    "img_size": 200,
+    "embed_dim": 96,
+    "depths": [4, 4, 4],
+    "num_heads": [6, 6, 6],
+    "window_size": 8,
+    "mlp_ratio": 4.0,
+    "residual_base": "bicubic",
+    "residual_gate_init": 0.1,
+    "drop_rate": 0.05,
+    "attn_drop_rate": 0.05,
+    "drop_path_rate": 0.1,
+    "head_dropout": 0.15
+  },
+  "training": {
+    "batch_size": 4,
+    "num_epochs": 50,
+    "learning_rate": 0.00005,
+    "weight_decay": 0.0001,
+    "nll_weight": 0.5,
+    "ms_weight": 1.0,
+    "freq_weight": 0.5,
+    "l1_weight": 0.0,
+    "spectral_weight": 0.0,
+    "gradient_weight": 0.0,
+    "quantile_weight": 0.0,
+    "spectral_low_freq_cutoff": 0.28,
+    "quantiles": [0.95, 0.99],
+    "multiscale": {
+      "n_levels": 5,
+      "base_sigma": 2,
+      "metric_per_band": ["l1", "sw", "sw", "sw", "sw"],
+      "metric_scale": {"l1": 1.0, "sw": 2.75},
+      "patch_size": 8,
+      "patch_stride": 4,
+      "n_projections": 64,
+      "sigma_floor": 0.001,
+      "sigma_max_samples": 2000,
+      "histogram_weight": 0.0,
+      "force_recompute_sigma_band": false
+    },
+    "freq_band": {
+      "n_levels": 5,
+      "base_sigma": 2,
+      "cdf_weight_mode": "down_extremes",
+      "sigma_floor": 0.001,
+      "sigma_max_samples": 2000,
+      "force_recompute_sigma_band": false
+    },
+    "grad_clip_norm": 1.0,
+    "num_workers": 2,
+    "val_interval": 1,
+    "early_stop_patience": 8,
+    "lr_milestone_fractions": [0.5, 0.75, 0.9],
+    "lr_gamma": 0.5
+  },
+  "logging": {
+    "log_every": 50
+  }
+}

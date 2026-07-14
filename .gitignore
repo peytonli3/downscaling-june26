@@ -1,0 +1,22 @@
+# Large binaries & regenerable artifacts — managed outside git.
+# NOTE: gitignore has no inline comments; keep patterns on their own lines.
+
+# Raw + derived data
+data/
+
+# Checkpoints
+*.pth
+
+# Numpy arrays
+*.npy
+*.npz
+
+# Optuna studies
+*.db
+
+# Figures (regenerable from scripts)
+*.png
+
+# Python caches
+__pycache__/
+*.pyc

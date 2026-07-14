@@ -1,0 +1,39 @@
+{
+  "seed": 0,
+  "paths": {
+    "data_dir": "/home/peytonli/26.6_wind/data",
+    "log_dir": "/home/peytonli/26.6_wind/logs/resnet_refiner",
+    "splits_path": "/home/peytonli/26.6_wind/data/splits_70_15_15/split_indices.npz"
+  },
+  "model": {
+    "img_size": 200,
+    "in_chans": 5,
+    "width": 64,
+    "num_blocks": 8,
+    "residual_scale": 0.1,
+    "activation": "relu",
+    "use_terrain": true,
+    "head_init_std": 0.001
+  },
+  "training": {
+    "batch_size": 4,
+    "num_epochs": 100,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.0,
+    "nll_weight": 0.0298203803117289,
+    "l1_weight": 1.0,
+    "spectral_weight": 2.1258793444504245,
+    "gradient_weight": 1.0363548238055016,
+    "quantile_weight": 0.0910226809309505,
+    "spectral_low_freq_cutoff": 0.28,
+    "quantiles": [0.95, 0.99],
+    "grad_clip_norm": 1.0,
+    "num_workers": 2,
+    "val_interval": 1,
+    "lr_milestone_fractions": [0.5, 0.75, 0.9],
+    "lr_gamma": 0.5
+  },
+  "logging": {
+    "log_every": 50
+  }
+}
