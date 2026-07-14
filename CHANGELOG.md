@@ -6,6 +6,24 @@ hyperparameters, training details) are not listed here.
 
 ---
 
+## Repo reorganization (2026-07-13)
+
+Not a model change — repository structure only.
+
+- **Now a git repo.** Versions are git tags (see `README.md`); binaries
+  (`data/`, `*.pth`, `*.npy`, `*.png`, `*.db`) are gitignored and managed on disk.
+- **Snapshot dirs removed.** `scripts/0626_v1` and `scripts/0628_v2` deleted;
+  `0628_v2`'s two scripts folded into flat `scripts/`. Old code recoverable via
+  tag `archive/pre-reorg-snapshots`.
+- **ResNet-refiner line retired.** Code in tag `archive/resnet-refiner`; binary
+  artifacts moved to `_archive/`.
+- **Recoverability gap:** the code for **0627** and **0629** was overwritten before
+  git existed and is *not* recoverable — only the diffs below describe it.
+- Kept `scripts/` flat (imports are bare-name) and left `data/`/`logs/`/
+  `inference_results/` in place (gitignored binaries; documented, not moved).
+
+---
+
 
 ## 0701 special
 

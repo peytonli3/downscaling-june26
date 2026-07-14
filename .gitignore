@@ -1,8 +1,9 @@
 # Large binaries & regenerable artifacts — managed outside git.
 # NOTE: gitignore has no inline comments; keep patterns on their own lines.
 
-# Raw + derived data
-data/
+# Raw + derived data (keep the manifest, ignore the binaries)
+data/*
+!data/README.md
 
 # Checkpoints
 *.pth
