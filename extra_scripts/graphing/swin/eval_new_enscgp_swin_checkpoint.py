@@ -1,53 +1,62 @@
 """
-Evaluate a trained ProbabilisticSwin2SR checkpoint (scripts/new_enscgp_swin.py) against
-ERA5 (LR) and WRF (HR) ground truth.
+Evaluate a trained ProbabilisticSwin2SR QUANTILE checkpoint (scripts/new_enscgp_swin.py,
+version 0714+) against ERA5 (LR) and WRF (HR) ground truth.
 
-For each sample, plots 7 panels:
+For each sample, plots 7 panels (one row per sample):
 1) ERA5 LR wind speed (native 34x34)
-2) WRF HR wind speed (200x200, ground truth)
-3) EnsCGP posterior mean wind speed (200x200) -- the first-guess SWIN starts from
-4) SWIN posterior mean wind speed (200x200) -- model's refined mu_u/mu_v
-5) SWIN posterior var(u)
-6) SWIN posterior var(v)
-7) Speed z-score: (SWIN predicted speed - WRF truth speed) / sigma_speed, i.e. how many
-   predicted standard deviations the speed prediction is off truth at each pixel.
+2) EnsCGP posterior mean wind speed (200x200) -- the first guess the model starts from,
+   read straight from data/enscgp_posterior.npy with no model involved
+3) WRF HR wind speed (200x200, ground truth)
+4) SWIN q10 field speed (200x200)  -- SCENARIO, see the warning below
+5) SWIN q50 field speed (200x200)  -- the central field the structural losses train
+6) SWIN q90 field speed (200x200)  -- SCENARIO, see the warning below
+7) CRPS (200x200), averaged over the u and v components -- see below
+Panels 1-6 share one speed color scale per row so they are directly comparable; CRPS gets
+its own sequential scale. Each wind-field panel carries a direction quiver overlay.
 
-Mirrors the panel layout/style of plot_enscgp_results.py (random sample selection,
-shared color scales within a row, land/sea contour overlay, wind-direction quiver arrows,
-the same north-up-ERA5/flipped-WRF display convention -- see that script's docstring for
-why the WRF-grid panels are flipped along axis 0 for display); panel 3 (EnsCGP) is read
-directly from that same data/enscgp_posterior.npy with no model involved, so it shows
-exactly what's fed to the model below. Unlike plot_enscgp_results.py, this script also runs
-real model inference: it loads new_enscgp_swin_config.json, builds a ProbabilisticSwin2SR,
-loads --checkpoint's model_state_dict (the format saved by train_new_enscgp_swin.py's
-save_checkpoint: model/optimizer/scheduler state + epoch + best_val_loss -- no embedded
-config, hence --config), and feeds it the EnsCGP posterior first-guess
-(data/enscgp_posterior.npy) plus the static terrain input, batched over all chosen sample
-indices in one forward pass.
+*** What panels 4 and 6 are NOT ***
+The model predicts per-pixel MARGINAL quantiles of u and of v SEPARATELY, and (unlike the
+retired Cholesky head) carries no u/v correlation. Panels 4/6 show
+speed(q10_u, q10_v) / speed(q90_u, q90_v): the speed OF THE COMPONENT-WISE QUANTILE FIELD --
+a scenario, NOT the 10th/90th percentile of wind speed. These are different things: e.g. at
+a pixel with q10_u = q10_v = -1.28, the "q10 field speed" is sqrt(1.28^2+1.28^2) = 1.81 --
+a HIGH speed, not a low one. So panel 4 is not a lower speed bound and panel 6 is not an
+upper one; do not read them as a speed confidence band. (Getting true speed percentiles
+would require assuming a u/v dependence the model does not provide -- e.g. sampling the
+marginals under independence -- which this script deliberately does not do.) Panel 5 (q50)
+is unaffected by this caveat in the usual sense: it is the model's central field, exactly
+the quantity the structural losses train.
 
-Sample source: by default, sample indices are drawn from the held-out test split
-(data/splits_70_15_15/split_indices.npz, test_idx) rather than the unrestricted pool
-plot_enscgp_results.py uses -- this script is meant to evaluate a trained checkpoint, so
-the model should not have seen these samples during training. --split train/val/test
-switches the pool; --sample_indices (raw indices into era5/wrf/posterior, as in
-plot_enscgp_results.py) bypasses split filtering entirely as an explicit override.
+CRPS: the Continuous Ranked Probability Score satisfies the quantile decomposition
+    CRPS(F, y) = 2 * integral_0^1 pinball_tau(F^-1(tau), y) dtau.
+With only three predicted quantiles the integral is approximated on the tau grid
+{0.1, 0.5, 0.9} by the midpoint rule -- each tau represents the interval to the midpoints of
+its neighbours (boundaries at 0.3 and 0.7, endpoints 0 and 1), giving weights
+{0.3, 0.4, 0.3} which sum to 1:
+    CRPS ~= 2 * (0.3*pinball_0.1 + 0.4*pinball_0.5 + 0.3*pinball_0.9)
+It is computed per pixel on each COMPONENT against that component's WRF truth (where the
+quantiles are genuinely marginal quantiles, so this is well posed -- no speed/dependence
+assumption), then the u and v maps are averaged into the single panel shown. This is a
+COARSE 3-point approximation: the true integrand is unrepresented in the tails beyond
+q10/q90, so treat the values as a relative comparison metric (lower = better, across
+pixels/samples/checkpoints), not an absolute CRPS.
 
-Speed z-score (panel 6): the model gives a per-pixel bivariate Gaussian over (u, v) (mean
-mu, covariance Sigma = L L^T from the predicted Cholesky factor), not a distribution over
-speed = sqrt(u^2+v^2) directly. sigma_speed is the delta-method (first-order Taylor)
-approximation:
-    Var(speed) ~= g_u^2 * var(u) + g_v^2 * var(v) + 2 * g_u * g_v * cov(u, v),
-    g_u = mu_u / speed, g_v = mu_v / speed   (gradient of sqrt(u^2+v^2) at the mean)
-This is exact only in the limit sigma << speed; it degrades when predicted speed is near
-zero (the gradient is singular there), so speed in the denominator of g_u/g_v is clamped
-to a small epsilon. The z-score itself, (pred_speed - truth_speed) / sigma_speed, is
-plotted on a FIXED [-3, 3] color scale (standard calibration-plot convention, comparable
-across samples/figures) rather than per-sample dynamic scaling; values beyond +/-3 sigma
-saturate the colormap. Positive z = SWIN over-predicted speed relative to its own claimed
-uncertainty; negative = under-predicted.
+Sample source: indices are drawn from the held-out test split by default
+(data/splits_70_15_15/split_indices.npz, test_idx), since this script evaluates a trained
+checkpoint and the model should not have seen these samples. --split train/val/test switches
+the pool; --sample_indices (raw indices into era5/wrf/posterior) bypasses split filtering.
+
+Display convention: all grids are north-up as stored (the "0701 special" alignment fix
+flipped the WRF .npy files north-south in the data dir, so no display-time flip is applied
+here). Panels use origin="upper"; quiver v is negated so +v (northward) points up the page.
+
+Checkpoint format: the dict saved by train_new_enscgp_swin.py's save_checkpoint
+(model/optimizer/scheduler state + epoch + best_val_loss -- no embedded config, hence
+--config). Requires a 0714+ quantile checkpoint (6-channel output); a pre-0714
+Gaussian/Cholesky checkpoint will fail to load (see CHANGELOG "0714").
 
 Usage:
-    python eval_new_enscgp_swin_checkpoint.py --checkpoint /home/peytonli/26.6_wind/logs/checkpoints/best.pth
+    python eval_new_enscgp_swin_checkpoint.py --checkpoint /home/peytonli/26.6_wind/runs/0714/checkpoints/best.pth
     python eval_new_enscgp_swin_checkpoint.py --checkpoint .../best.pth --split test --n_samples 6 --seed 42
     python eval_new_enscgp_swin_checkpoint.py --checkpoint .../best.pth --sample_indices 12,4081,6500
 """
@@ -65,8 +74,13 @@ SCRIPTS_DIR = "/net/flood/home/peytonli/26.6_wind/scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from new_enscgp_swin import DEFAULT_CONFIG_PATH, build_model, load_config  # noqa: E402
+from new_enscgp_swin import DEFAULT_CONFIG_PATH, ProbabilisticSwin2SR, build_model, load_config  # noqa: E402
 from terrain_encoder import load_terrain_input  # noqa: E402
+
+# Quantile levels the model predicts, with midpoint-rule integration weights over tau in
+# [0, 1] (boundaries at 0.3 / 0.7) for the CRPS quantile decomposition -- see docstring.
+CRPS_TAUS = (0.1, 0.5, 0.9)
+CRPS_WEIGHTS = (0.3, 0.4, 0.3)
 
 
 def choose_indices(pool: np.ndarray, n_total: int, n_samples: int, seed: int, sample_indices: str | None) -> np.ndarray:
@@ -87,16 +101,21 @@ def speed(u: np.ndarray, v: np.ndarray) -> np.ndarray:
     return np.sqrt(u ** 2 + v ** 2)
 
 
-def speed_zscore(mu_u: np.ndarray, mu_v: np.ndarray, var_u: np.ndarray, var_v: np.ndarray, cov_uv: np.ndarray,
-                  truth_speed: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    """(pred_speed - truth_speed) / sigma_speed, sigma_speed via the delta-method linearization
-    of speed=sqrt(u^2+v^2) at the predicted mean (see module docstring)."""
-    pred_speed = speed(mu_u, mu_v)
-    s_safe = np.maximum(pred_speed, eps)
-    g_u, g_v = mu_u / s_safe, mu_v / s_safe
-    var_speed = g_u ** 2 * var_u + g_v ** 2 * var_v + 2 * g_u * g_v * cov_uv
-    sigma_speed = np.sqrt(np.clip(var_speed, 0.0, None))
-    return (pred_speed - truth_speed) / np.maximum(sigma_speed, eps)
+def pinball(q: np.ndarray, truth: np.ndarray, tau: float) -> np.ndarray:
+    """Per-pixel pinball (tilted-L1) loss at quantile level tau."""
+    err = truth - q
+    return np.maximum(tau * err, (tau - 1.0) * err)
+
+
+def crps_from_quantiles(q_by_tau: tuple[np.ndarray, ...], truth: np.ndarray) -> np.ndarray:
+    """Per-pixel CRPS via the quantile decomposition, approximated on CRPS_TAUS with the
+    midpoint-rule CRPS_WEIGHTS (see module docstring). q_by_tau is aligned with CRPS_TAUS and
+    must be MARGINAL quantiles of the same scalar quantity as truth (here: one wind
+    component). Coarse 3-point rule -- use for relative comparison, not as an absolute CRPS."""
+    total = np.zeros_like(truth, dtype=np.float64)
+    for tau, w, q in zip(CRPS_TAUS, CRPS_WEIGHTS, q_by_tau):
+        total += w * pinball(q, truth, tau)
+    return 2.0 * total
 
 
 def plot_panel(
@@ -114,7 +133,7 @@ def plot_panel(
         # V is negated: imshow(origin="upper") inverts the y-axis, so +v (northward) must point
         # toward decreasing row index to still point up the page (see module docstring).
         ax.quiver(X, Y, u[::skip, ::skip], -v[::skip, ::skip], color="black", scale_units="xy")
-    ax.set_title(title, fontsize=10)
+    ax.set_title(title, fontsize=9)
     ax.set_xticks([])
     ax.set_yticks([])
     plt.colorbar(im, ax=ax, orientation="vertical", shrink=0.8, label=cbar_label)
@@ -138,24 +157,25 @@ def main() -> None:
         "--sample_indices", type=str, default=None,
         help="Comma-separated raw sample indices (overrides --split/--n_samples/--seed), e.g. 0,25,100",
     )
-    parser.add_argument("--output", type=Path, default=Path("/home/peytonli/26.6_wind/inference_results/0701/swin_checkpoint_panels.png"), help="Output PNG path")
+    parser.add_argument("--output", type=Path, default=None, help="Output PNG. Defaults to <log_dir>/figures/swin_quantile_panels.png")
     parser.add_argument("--quiver_skip_lr", type=int, default=2, help="Arrow subsampling on the 34x34 ERA5 panel")
-    parser.add_argument("--quiver_skip_hr", type=int, default=10, help="Arrow subsampling on the 200x200 WRF/SWIN panels")
-    parser.add_argument("--z_clip", type=float, default=3.0, help="Fixed +/- color-scale bound for the speed z-score panel")
+    parser.add_argument("--quiver_skip_hr", type=int, default=10, help="Arrow subsampling on the 200x200 panels")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dpi", type=int, default=150)
     args = parser.parse_args()
 
     config = load_config(args.config)
     paths = config["paths"]
+    log_dir = Path(paths["log_dir"])
     data_dir = args.data_dir or Path(paths["data_dir"])
-    checkpoint_path = args.checkpoint or (Path(paths["log_dir"]) / "checkpoints" / "best.pth")
+    checkpoint_path = args.checkpoint or (log_dir / "checkpoints" / "best.pth")
     splits_path = args.splits_path or Path(paths["splits_path"])
     era5_path = args.era5_path or (data_dir / "era5_uv_2ch_native34.npy")
     wrf_path = args.wrf_path or (data_dir / "wrf_uv.npy")
     posterior_path = args.posterior_path or (data_dir / "enscgp_posterior.npy")
     bicubic_path = args.bicubic_path or (data_dir / "era5_uv_2ch_bicubic.npy")
     hires_land_mask_path = args.hires_land_mask_path or (data_dir / "land_mask_hires.npz")
+    output_path = args.output or (log_dir / "figures" / "swin_quantile_panels.png")
 
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -184,66 +204,85 @@ def main() -> None:
     posterior_batch = torch.from_numpy(np.array(posterior[idx], dtype=np.float32, copy=True)).to(device)
     bicubic_batch = torch.from_numpy(np.array(bicubic[idx], dtype=np.float32, copy=True)).to(device)
     with torch.no_grad():
-        pred_batch = model(posterior_batch, bicubic_batch, terrain_raw).cpu().numpy()  # (B, 5, 200, 200): mu_u, mu_v, L11, L21, L22
+        # (B, 6, 200, 200): [q10_u, q10_v, q50_u, q50_v, q90_u, q90_v]
+        pred_batch = model(posterior_batch, bicubic_batch, terrain_raw).cpu().numpy()
+    if pred_batch.shape[1] != ProbabilisticSwin2SR.OUT_CHANNELS:
+        raise ValueError(
+            f"Expected a {ProbabilisticSwin2SR.OUT_CHANNELS}-channel quantile model output, got "
+            f"{pred_batch.shape[1]}. Is {checkpoint_path} a pre-0714 Gaussian/Cholesky checkpoint?"
+        )
 
     col_titles = [
         "ERA5 LR speed (34x34)",
-        "WRF HR speed (ground truth)",
         "EnsCGP posterior mean speed",
-        "SWIN posterior mean speed",
-        "SWIN var(u)",
-        "SWIN var(v)",
-        "Speed z-score: (pred-truth)/sigma",
+        "WRF HR speed (ground truth)",
+        "SWIN q10 field speed (scenario, not %ile)",
+        "SWIN q50 speed (central field)",
+        "SWIN q90 field speed (scenario, not %ile)",
+        "CRPS (mean of u,v; 3-quantile approx.)",
     ]
-    cbar_labels = ["m/s", "m/s", "m/s", "m/s", "(m/s)^2", "(m/s)^2", "sigma"]
+    cbar_labels = ["m/s", "m/s", "m/s", "m/s", "m/s", "m/s", "m/s"]
 
     n_rows, n_cols = len(idx), len(col_titles)
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.2 * n_cols, 3.2 * n_rows), squeeze=False)
 
+    crps_means = []
     for row, i in enumerate(idx):
         era5_u, era5_v = np.asarray(era5[i, 0]), np.asarray(era5[i, 1])
         wrf_u, wrf_v = np.asarray(wrf[i, 0]), np.asarray(wrf[i, 1])
-        ens_u, ens_v = np.asarray(posterior[i, 0]), np.asarray(posterior[i, 1])  # EnsCGP first guess fed to the model
-        mu_u, mu_v, L11, L21, L22 = pred_batch[row]
+        ens_u, ens_v = np.asarray(posterior[i, 0]), np.asarray(posterior[i, 1])
+        q10_u, q10_v = pred_batch[row, 0], pred_batch[row, 1]
+        q50_u, q50_v = pred_batch[row, 2], pred_batch[row, 3]
+        q90_u, q90_v = pred_batch[row, 4], pred_batch[row, 5]
 
         era5_speed = speed(era5_u, era5_v)
         wrf_speed = speed(wrf_u, wrf_v)
         ens_speed = speed(ens_u, ens_v)
-        pred_speed = speed(mu_u, mu_v)
+        # Speed OF the component-wise quantile fields -- scenarios, not speed percentiles.
+        q10_speed = speed(q10_u, q10_v)
+        q50_speed = speed(q50_u, q50_v)
+        q90_speed = speed(q90_u, q90_v)
 
-        var_u = L11 ** 2
-        var_v = L21 ** 2 + L22 ** 2
-        cov_uv = L11 * L21
-        z = speed_zscore(mu_u, mu_v, var_u, var_v, cov_uv, wrf_speed)
+        # CRPS per component (well posed: marginal quantiles vs that component's truth),
+        # then averaged into a single map.
+        crps_u = crps_from_quantiles((q10_u, q50_u, q90_u), wrf_u)
+        crps_v = crps_from_quantiles((q10_v, q50_v, q90_v), wrf_v)
+        crps = 0.5 * (crps_u + crps_v)
+        crps_means.append(float(crps.mean()))
 
-        speed_vmin = float(min(era5_speed.min(), wrf_speed.min(), ens_speed.min(), pred_speed.min()))
-        speed_vmax = float(max(era5_speed.max(), wrf_speed.max(), ens_speed.max(), pred_speed.max()))
-        var_vmax = max(float(max(var_u.max(), var_v.max())), 1e-12)
+        speed_fields = (era5_speed, ens_speed, wrf_speed, q10_speed, q50_speed, q90_speed)
+        speed_vmin = float(min(f.min() for f in speed_fields))
+        speed_vmax = float(max(f.max() for f in speed_fields))
 
         panels = [
             (era5_speed, "jet", speed_vmin, speed_vmax, lsm_era34, (era5_u, era5_v), args.quiver_skip_lr),
-            (wrf_speed, "jet", speed_vmin, speed_vmax, lsm_wrf, (wrf_u, wrf_v), args.quiver_skip_hr),
             (ens_speed, "jet", speed_vmin, speed_vmax, lsm_wrf, (ens_u, ens_v), args.quiver_skip_hr),
-            (pred_speed, "jet", speed_vmin, speed_vmax, lsm_wrf, (mu_u, mu_v), args.quiver_skip_hr),
-            (var_u, "magma", 0.0, var_vmax, lsm_wrf, None, 1),
-            (var_v, "magma", 0.0, var_vmax, lsm_wrf, None, 1),
-            (z, "RdBu_r", -args.z_clip, args.z_clip, lsm_wrf, None, 1),
+            (wrf_speed, "jet", speed_vmin, speed_vmax, lsm_wrf, (wrf_u, wrf_v), args.quiver_skip_hr),
+            (q10_speed, "jet", speed_vmin, speed_vmax, lsm_wrf, (q10_u, q10_v), args.quiver_skip_hr),
+            (q50_speed, "jet", speed_vmin, speed_vmax, lsm_wrf, (q50_u, q50_v), args.quiver_skip_hr),
+            (q90_speed, "jet", speed_vmin, speed_vmax, lsm_wrf, (q90_u, q90_v), args.quiver_skip_hr),
+            (crps, "magma", 0.0, max(float(crps.max()), 1e-12), lsm_wrf, None, 1),
         ]
         for col, (data, cmap, vmin, vmax, lsm, uv, qskip) in enumerate(panels):
             title = f"{col_titles[col]} | idx={i}" if col == 0 else col_titles[col]
             plot_panel(axes[row, col], data, cmap, vmin, vmax, title, cbar_labels[col], lsm=lsm, uv=uv, quiver_skip=qskip)
 
-    fig.suptitle(f"SWIN checkpoint eval vs ERA5 / WRF (split={args.split}, ckpt={checkpoint_path.name})", fontsize=14, y=1.0)
+    fig.suptitle(
+        f"SWIN quantile checkpoint eval vs ERA5 / WRF (split={args.split}, ckpt={checkpoint_path.name})",
+        fontsize=14, y=1.0,
+    )
     fig.tight_layout()
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(args.output), dpi=args.dpi, bbox_inches="tight")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(output_path), dpi=args.dpi, bbox_inches="tight")
     plt.close(fig)
 
-    print(f"Saved figure: {args.output}")
+    print(f"Saved figure: {output_path}")
     print(f"Checkpoint: {checkpoint_path} (epoch {ckpt.get('epoch')}, best_val_loss {ckpt.get('best_val_loss')})")
     print(f"Split: {args.split}")
     print(f"Samples used: {idx.tolist()}")
+    print(f"Mean CRPS over shown samples: {np.mean(crps_means):.4f}  (per-sample: "
+          f"{', '.join(f'{v:.4f}' for v in crps_means)})")
 
 
 if __name__ == "__main__":
