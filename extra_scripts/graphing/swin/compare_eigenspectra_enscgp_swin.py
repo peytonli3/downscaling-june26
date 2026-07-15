@@ -5,8 +5,23 @@ stages for the EnsCGP -> ProbabilisticSwin2SR wind-downscaling pipeline:
 
 1. ERA5 bicubic interpolation (naive upsampling baseline; data/era5_uv_2ch_bicubic.npy)
 2. EnsCGP posterior mean (first guess fed to the model; data/enscgp_posterior.npy)
-3. ProbabilisticSwin2SR model output (mu_u, mu_v from a trained checkpoint)
+3. ProbabilisticSwin2SR model output -- the CENTRAL field (q50_u, q50_v) from a trained
+   0714+ quantile checkpoint
 4. WRF (200x200 ground truth; data/wrf_uv.npy)
+
+Despite the name, this script takes no eigenvalues of any covariance: "eigenspectra" here
+means the radial-averaged PSD of the u/v FIELDS. It therefore survived the 0714 switch from
+the Gaussian/Cholesky head to quantiles unchanged in substance -- only which output channels
+carry the central field moved. The model now emits 6 channels
+[q10_u, q10_v, q50_u, q50_v, q90_u, q90_v]; the central field is the Q50 pair, which is the
+direct analog of the old predicted mean (it is literally still mean_head's output, and it is
+the field the structural losses train). NOTE: channels 0-1 are now q10, NOT the mean -- read
+the central field via ProbabilisticSwin2SR.Q50_SLICE, never by raw index 0/1.
+
+The q10/q90 envelopes are deliberately NOT plotted: an uncertainty envelope is not a wind
+field, so its spectrum has no "should match WRF" target (the same category error the loss in
+train_new_enscgp_swin.py is careful to avoid). The question this figure asks is whether the
+model's central field recovers the high-wavenumber content that bicubic/EnsCGP lack.
 
 All four already live on the same 200x200 grid (no upsampling step needed, unlike
 26.3_wind/SWIN/evaluation/compare_eigenspectra_downscaled.py, which this mirrors --
@@ -32,7 +47,7 @@ held-out test split (data/splits_70_15_15/split_indices.npz); --sample_indices b
 split filtering with explicit raw indices.
 
 Usage:
-    python compare_eigenspectra_enscgp_swin.py --checkpoint /home/peytonli/26.6_wind/logs/checkpoints/best.pth
+    python compare_eigenspectra_enscgp_swin.py --checkpoint /home/peytonli/26.6_wind/runs/0714/checkpoints/best.pth
     python compare_eigenspectra_enscgp_swin.py --checkpoint .../best.pth --n_samples 32
     python compare_eigenspectra_enscgp_swin.py --checkpoint .../best.pth --sample_indices 12,4081,6500
 """
@@ -51,12 +66,12 @@ SCRIPTS_DIR = "/home/peytonli/26.6_wind/scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from new_enscgp_swin import DEFAULT_CONFIG_PATH, build_model, load_config  # noqa: E402
+from new_enscgp_swin import DEFAULT_CONFIG_PATH, ProbabilisticSwin2SR, build_model, load_config  # noqa: E402
 from terrain_encoder import load_terrain_input  # noqa: E402
 
-SOURCES = ("ERA5 bicubic", "EnsCGP posterior", "SWIN output", "WRF (truth)")
-COLORS = {"ERA5 bicubic": "purple", "EnsCGP posterior": "C0", "SWIN output": "green", "WRF (truth)": "C1"}
-STYLES = {"ERA5 bicubic": "--", "EnsCGP posterior": "--", "SWIN output": "-", "WRF (truth)": "-"}
+SOURCES = ("ERA5 bicubic", "EnsCGP posterior", "SWIN output (q50)", "WRF (truth)")
+COLORS = {"ERA5 bicubic": "purple", "EnsCGP posterior": "C0", "SWIN output (q50)": "green", "WRF (truth)": "C1"}
+STYLES = {"ERA5 bicubic": "--", "EnsCGP posterior": "--", "SWIN output (q50)": "-", "WRF (truth)": "-"}
 COMPONENTS = ("u", "v")
 
 # WRF native 200x200 grid spacing (km/pixel), computed via haversine distance between
@@ -163,7 +178,9 @@ def choose_indices(pool: np.ndarray, n_total: int, n_samples: int, seed: int, sa
 
 
 def compute_spectra(idx: np.ndarray, bicubic, posterior, wrf, pred_batch: np.ndarray, dx_km: float, dy_km: float):
-    """Return (k_km, spectra) where spectra maps component ('u'|'v') -> {source: (n_samples, L) array}."""
+    """Return (k_km, spectra) where spectra maps component ('u'|'v') -> {source: (n_samples, L) array}.
+    pred_batch is the model's CENTRAL field only, (B, 2, H, W) = [q50_u, q50_v] -- sliced in
+    main() via Q50_SLICE, so comp_idx indexes u/v here (not the 6-channel raw output)."""
     spectra = {comp: {s: [] for s in SOURCES} for comp in COMPONENTS}
     k_common = None
     for row, i in enumerate(idx):
@@ -181,7 +198,7 @@ def compute_spectra(idx: np.ndarray, bicubic, posterior, wrf, pred_batch: np.nda
             L = min(len(s_b), len(s_e), len(s_p), len(s_w))
             spectra[comp]["ERA5 bicubic"].append(s_b[:L])
             spectra[comp]["EnsCGP posterior"].append(s_e[:L])
-            spectra[comp]["SWIN output"].append(s_p[:L])
+            spectra[comp]["SWIN output (q50)"].append(s_p[:L])
             spectra[comp]["WRF (truth)"].append(s_w[:L])
             k_common = k_b[:L]
 
@@ -280,19 +297,21 @@ def main() -> None:
     parser.add_argument("--pct_upper", type=float, default=90.0, help="Upper percentile when --band pct")
     parser.add_argument("--zoom_km", type=float, nargs=2, default=None, metavar=("LO_KM", "HI_KM"),
                         help="Zoom x-axis to this wavelength range in km, e.g. --zoom_km 10 70")
-    parser.add_argument("--output", type=Path,
-                         default=Path("/home/peytonli/26.6_wind/inference_results/0701/eigenspectra_aggregate_swin.png"))
+    parser.add_argument("--output", type=Path, default=None,
+                         help="Output PNG. Defaults to <log_dir>/figures/eigenspectra_aggregate_swin.png")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     config = load_config(args.config)
     paths = config["paths"]
+    log_dir = Path(paths["log_dir"])
     data_dir = args.data_dir or Path(paths["data_dir"])
-    checkpoint_path = args.checkpoint or (Path(paths["log_dir"]) / "checkpoints" / "best.pth")
+    checkpoint_path = args.checkpoint or (log_dir / "checkpoints" / "best.pth")
     splits_path = args.splits_path or Path(paths["splits_path"])
     wrf_path = args.wrf_path or (data_dir / "wrf_uv.npy")
     posterior_path = args.posterior_path or (data_dir / "enscgp_posterior.npy")
     bicubic_path = args.bicubic_path or (data_dir / "era5_uv_2ch_bicubic.npy")
+    output_path = args.output or (log_dir / "figures" / "eigenspectra_aggregate_swin.png")
 
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -316,10 +335,20 @@ def main() -> None:
     posterior_batch = torch.from_numpy(np.array(posterior[idx], dtype=np.float32, copy=True)).to(device)
     bicubic_batch = torch.from_numpy(np.array(bicubic[idx], dtype=np.float32, copy=True)).to(device)
     with torch.no_grad():
-        pred_batch = model(posterior_batch, bicubic_batch, terrain_raw).cpu().numpy()  # (B, 5, H, W): mu_u, mu_v, L11, L21, L22
+        # (B, 6, H, W): [q10_u, q10_v, q50_u, q50_v, q90_u, q90_v]
+        pred_batch = model(posterior_batch, bicubic_batch, terrain_raw).cpu().numpy()
+    if pred_batch.shape[1] != ProbabilisticSwin2SR.OUT_CHANNELS:
+        raise ValueError(
+            f"Expected a {ProbabilisticSwin2SR.OUT_CHANNELS}-channel quantile model output, got "
+            f"{pred_batch.shape[1]}. Is {checkpoint_path} a pre-0714 Gaussian/Cholesky checkpoint?"
+        )
+    # The CENTRAL field, the analog of the old predicted mean. Must be taken via Q50_SLICE:
+    # channels 0-1 are q10 under the quantile head, so raw index 0/1 would silently plot the
+    # lower envelope's spectrum as "SWIN output".
+    q50_batch = pred_batch[:, ProbabilisticSwin2SR.Q50_SLICE]  # (B, 2, H, W)
 
-    k_km, spectra = compute_spectra(idx, bicubic, posterior, wrf, pred_batch, args.dx_km, args.dy_km)
-    plot_aggregate(idx, k_km, spectra, args.band, args.pct_lower, args.pct_upper, args.x_units, args.output,
+    k_km, spectra = compute_spectra(idx, bicubic, posterior, wrf, q50_batch, args.dx_km, args.dy_km)
+    plot_aggregate(idx, k_km, spectra, args.band, args.pct_lower, args.pct_upper, args.x_units, output_path,
                    zoom_km=args.zoom_km)
 
     print(f"Checkpoint: {checkpoint_path} (epoch {ckpt.get('epoch')}, best_val_loss {ckpt.get('best_val_loss')})")
