@@ -1,88 +1,80 @@
-"""Two-head probabilistic Swin2SR refiner for wind downscaling (ERA5 -> WRF).
+"""Two-head probabilistic Swin2SR refiner for wind downscaling (ERA5 -> WRF),
+QUANTILE version (q10/q50/q90 per component -- replaces the Gaussian/Cholesky head).
 
 Wraps the Swin2SR backbone (network_swin2sr.py) at upscale=1 -- same-resolution
 restoration, not super-resolution -- and replaces its single-conv reconstruction
 tail with two parallel heads on top of the embed_dim deep-feature map (shallow
 features + RSTB body + conv_after_body + long skip, all unchanged from Swin2SR).
 
-Inputs (forward(posterior, bicubic, terrain_raw, prior_spread=None)):
+Wind is heavy-tailed / right-skewed, so a per-pixel Gaussian is a poor fit. Instead
+of a mean + 2x2 Cholesky covariance trained by NLL, each head now predicts DIRECT,
+distribution-free quantiles per component (u, v): q10, q50, q90.
+
+Inputs (forward(posterior, bicubic, terrain_raw)):
 - posterior: (B, 5, H, W) EnsCGP first-guess posterior [u, v, L11, L21, L22]
-  (e.g. data/enscgp_posterior.npy, see enscgp_train.py).
+  (e.g. data/enscgp_posterior.npy, see enscgp_train.py). The Cholesky channels are
+  still fed in as model input AND used to seed the initial q10/q90 spread (below),
+  but there is no Cholesky OUTPUT and no NLL any more.
 - bicubic: (B, 2, H, W) bicubic-upsampled ERA5 wind [u, v]
   (data/era5_uv_2ch_bicubic.npy) -- the naive low-resolution baseline. Always fed
-  in as an input channel (see model_input below) regardless of residual_base.
+  in as an input channel regardless of residual_base.
 - terrain_raw: (1, 4, 1000, 1000) static terrain input for TerrainEncoder (see
   terrain_encoder.py), shared by every sample -- broadcast across the batch.
-  TerrainEncoder is a submodule here (not a frozen precomputed feature map),
-  so its weights are trained jointly with the rest of the network.
-- prior_spread: (B, 2, H, W) per-pixel EnsCGP PRIOR (pre-conditioning) ensemble
-  spread for [u, v] -- the analog-disagreement signal (std across each sample's k
-  WRF analogs, see scripts/precompute_prior_spread.py). Only consumed when
-  variance_conditioning is on (else ignored / may be None); see "Variance
-  conditioning" below.
-
-Variance conditioning (config-gated, default OFF -> exact current behavior):
-when model.variance_conditioning is on, the chol_head (variance head ONLY) is
-additionally conditioned on features that predict WHERE placement is uncertain, so
-it can inflate sigma on the coherent "wrong-bet" blotches the mean produces. Four
-extra channels are fed into the chol_head's first conv via a SEPARATE conv
-(chol_cond), zero-initialized so at init it contributes nothing and the model
-output is identical to the unconditioned checkpoint (then chol_cond learns during
-fine-tuning). The four conditioning channels (standardized by cond_mean/cond_std
-buffers, see load_cond_stats) are:
-  [0,1] prior_spread u, v        -- analog disagreement (the key signal)
-  [2]   |grad(speed(mean))|      -- sharp mean-wind gradients = displaceable structure
-                                    (computed from the DETACHED mean, so no grad flows
-                                    back into the mean head/backbone)
-  [3]   |terrain slope|          -- sqrt(u_slope^2+v_slope^2) from terrain_raw[:,2:4],
-                                    avg-pooled 5x to the WRF grid (static across samples)
-The mean head, backbone, and loss are untouched by conditioning -- only chol_cond
-(new) plus the existing chol_head/chol_gate are involved.
+  TerrainEncoder is a submodule here (trained jointly with the rest of the network).
 
 The per-pixel model input is assembled inside forward() as
   model_input = cat([bicubic, enscgp_mean - bicubic, L11, L21, L22], dim=1)
-(7 channels: [bic_u, bic_v, res_u, res_v, L11, L21, L22]) -- i.e. the EnsCGP u/v
-channels are replaced by the bicubic field and the EnsCGP-mean-minus-bicubic
-residual (their sum still recovers the EnsCGP mean, so no information is lost).
-This input decomposition is independent of residual_base below (which only
-controls what each head's output is added to).
+(7 channels: [bic_u, bic_v, res_u, res_v, L11, L21, L22]) -- the EnsCGP u/v channels
+are replaced by the bicubic field and the EnsCGP-mean-minus-bicubic residual (their
+sum still recovers the EnsCGP mean). This is independent of residual_base (which only
+controls what the q50 head's output is added to).
 x = cat([model_input, terrain_encoder(terrain_raw)], dim=1) feeds conv_first.
 
 Heads -- gated residual onto a base, not near-zero-init pass-through:
-- mean_head: 2 channels (mu_u, mu_v). Output = mean_base + mean_gate * head(feats),
-  where mean_base is selected by residual_base ("enscgp" (default) -> EnsCGP
-  posterior mean, "bicubic" -> the bicubic baseline, "none" -> zero, i.e. predict
-  the absolute mean directly). mean_gate is a learnable scalar (nn.Parameter,
-  init residual_gate_init, default 0.1).
-- chol_head: 3 channels (L11, L21, L22), the lower-triangular Cholesky factor of
-  the per-pixel 2x2 (u, v) covariance, Sigma = L @ L.T. Output is gated onto
-  EnsCGP's OWN per-pixel Cholesky (posterior[:, 2:5]) -- not configurable via
-  residual_base, since EnsCGP always provides a natural starting covariance and
-  "bicubic"/"none" have no covariance analog. Positivity is preserved exactly:
-  the diagonal perturbation chol_gate * head(feats) is added in inverse-softplus
-  (pre-activation) space around the base, then mapped back through softplus, so
-  L11/L22 stay > 0 by construction however large the gated perturbation gets;
-  L21 (unconstrained) is a direct gated addition.
-Both heads' final conv now uses standard Kaiming-normal init (not near-zero) --
-the *gate*, not a suppressed weight, is what keeps a fresh model's contribution
-small ("start gentle, free to grow": small initially, but the head itself is
-full-strength from step 0, so gradient flows normally and the gate alone can grow
-during training).
+- mean_head (the q50 / central head): 2 channels (q50_u, q50_v). Output =
+  mean_base + mean_gate * head(feats), where mean_base is selected by residual_base
+  ("enscgp" (default) -> EnsCGP posterior mean, "bicubic" -> bicubic baseline,
+  "none" -> zero). mean_gate is a learnable scalar (init residual_gate_init, 0.1).
+  q50 keeps EXACTLY the role the old mean had: it is the field the structural losses
+  (multi-scale Wasserstein + frequency-L1) train, so it stays sharp. It is NOT
+  pinball-trained (that would pull it toward the blurry pointwise median and fight
+  the displacement-tolerant structural losses).
+- offset_head: 4 channels (raw_up_u, raw_up_v, raw_down_u, raw_down_v). Two
+  NON-NEGATIVE offsets per component are formed by softplus (never relu -- relu has a
+  dead zone where the spread can collapse to exactly zero with zero gradient; softplus
+  stays positive and always trainable), then the quantiles are MONOTONIC BY
+  CONSTRUCTION (q10 <= q50 <= q90, no crossing, no crossing penalty needed):
+      up_offset   = softplus(inv_softplus(scale * sigma) + offset_gate * raw_up)   + OFFSET_EPS
+      down_offset = softplus(inv_softplus(scale * sigma) + offset_gate * raw_down) + OFFSET_EPS
+      q90 = q50 + up_offset
+      q10 = q50 - down_offset
+  where sigma is the EnsCGP per-pixel MARGINAL std (sigma_u = L11, sigma_v =
+  sqrt(L21^2 + L22^2)) and scale = init_spread_scale (default 1.28 ~= Phi^-1(0.9)).
+  The perturbation is gated in inverse-softplus (pre-activation) space around the
+  scale*sigma base -- exactly the mechanism the old Cholesky diagonal used -- so a
+  fresh model (small offset_gate) emits q10/q90 ~= q50 -/+ 1.28*sigma per pixel: the
+  EnsCGP posterior expressed as a symmetric 80% band. OFFSET_EPS floors each offset
+  so the band can never underflow to zero. As training proceeds the head learns
+  per-pixel, ASYMMETRIC offsets (up can grow more than down for the right tail).
 
-forward() returns a single (B, 5, H, W) tensor ordered [mu_u, mu_v, L11, L21,
-L22] -- matching the EnsCGP output convention.
+Both heads' final conv uses standard Kaiming-normal init (not near-zero) -- the
+*gate*, not a suppressed weight, keeps a fresh model's contribution small.
 
-Architecture and regularization hyperparameters live in a JSON config (see
-new_enscgp_swin_config.json), following the same "model" section convention as
-26.3_wind/SWIN/wind_swin2sr_config.json. Regularization knobs (all optional,
-defaulting to current behavior): drop_rate / attn_drop_rate / drop_path_rate on the
-Swin backbone, and head_dropout (channel dropout in the two conv heads). in_chans is
-not configurable: it's derived from INPUT_CHANNELS + the terrain encoder's actual
-output channels.
+forward() returns a single (B, 6, H, W) tensor ordered [q10_u, q10_v, q50_u, q50_v,
+q90_u, q90_v] (ascending quantile blocks; see Q10_SLICE / Q50_SLICE / Q90_SLICE).
 
-NOTE: this is an architecture change from the previous near-zero-init/bicubic-base
-design (different state_dict shapes: mean_gate/chol_gate are new parameters) --
-checkpoints trained before this change will not load with strict=True.
+Loss lives in train_new_enscgp_swin.py: structural losses on q50 (unchanged) +
+pinball(q90, .9) + pinball(q10, .1), with optional extreme (high-wind) up-weighting.
+
+Architecture / regularization hyperparameters live in a JSON config (see
+new_enscgp_swin_config.json). in_chans is not configurable: it's INPUT_CHANNELS + the
+terrain encoder's actual output channels.
+
+NOTE: this is a checkpoint-incompatible architecture change from the Gaussian/Cholesky
+version (offset_head/offset_gate replace chol_head/chol_gate; 6-channel output).
+Old checkpoints load PARTIALLY (backbone + terrain_encoder + mean_head + mean_gate
+transfer; the offset head starts fresh) -- see train_new_enscgp_swin.py's
+--resume-weights-only.
 
 Usage:
     python new_enscgp_swin.py [--config new_enscgp_swin_config.json]
@@ -105,26 +97,29 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "new_enscgp_swin_config.
 class ProbabilisticSwin2SR(Swin2SR):
     POSTERIOR_CHANNELS = 5  # EnsCGP first guess [u, v, L11, L21, L22], see enscgp_train.py
     # Per-pixel model input assembled in forward(): [bic_u, bic_v, res_u, res_v, L11, L21,
-    # L22], i.e. the bicubic baseline, the EnsCGP-mean-minus-bicubic residual, and the
-    # EnsCGP Cholesky channels.
+    # L22] -- the bicubic baseline, the EnsCGP-mean-minus-bicubic residual, and the EnsCGP
+    # Cholesky channels (still an INPUT; there is just no Cholesky output any more).
     INPUT_CHANNELS = 7
+    OUT_CHANNELS = 6  # [q10_u, q10_v, q50_u, q50_v, q90_u, q90_v]
+    Q10_SLICE = slice(0, 2)
+    Q50_SLICE = slice(2, 4)
+    Q90_SLICE = slice(4, 6)
     RESIDUAL_BASES = ("enscgp", "bicubic", "none")
-    CHOL_EPS = 1e-4  # floor on the EnsCGP base Cholesky diagonal before inverse-softplus
-    COND_CHANNELS = 4  # variance-conditioning features: [prior_spread_u, prior_spread_v, |grad speed(mean)|, |terrain slope|]
-    GRAD_EPS = 1e-6    # floor inside the speed / gradient-magnitude square roots
+    SOFTPLUS_EPS = 1e-4  # floor before inverse-softplus (shared by the sigma base)
+    OFFSET_EPS = 1e-3    # hard floor on each quantile offset -- spread can't underflow to 0
+    GRAD_EPS = 1e-6      # floor inside the sigma_v square root
 
     def __init__(self, img_size=200, embed_dim=96,
                  depths=(4, 4, 4), num_heads=(6, 6, 6), window_size=8,
                  mlp_ratio=4., residual_base="enscgp", residual_gate_init=0.1,
-                 head_dropout=0.0, variance_conditioning=False, **kwargs):
+                 init_spread_scale=1.28, head_dropout=0.0, **kwargs):
         # Backbone dropout knobs (drop_rate / attn_drop_rate / drop_path_rate) flow
-        # through **kwargs to Swin2SR; head_dropout is consumed here (channel dropout in
-        # the two conv heads). All default to current behavior -- see build_model.
+        # through **kwargs to Swin2SR; head_dropout is consumed here. All default to
+        # current behavior -- see build_model.
         if residual_base not in self.RESIDUAL_BASES:
             raise ValueError(f"residual_base must be one of {self.RESIDUAL_BASES}, got {residual_base!r}")
-        # Built before super().__init__() so its (fixed) output channel count can
-        # feed in_chans; reassigned as a submodule below once nn.Module.__init__
-        # (called inside Swin2SR.__init__) has run.
+        # Built before super().__init__() so its (fixed) output channel count can feed
+        # in_chans; reassigned as a submodule below once nn.Module.__init__ has run.
         terrain_encoder = TerrainEncoder()
         terrain_out_channels = terrain_encoder.body[-1].out_channels
         in_chans = self.INPUT_CHANNELS + terrain_out_channels
@@ -139,48 +134,29 @@ class ProbabilisticSwin2SR(Swin2SR):
         del self.conv_last  # base class's single-head tail; replaced by the two heads below
 
         self.residual_base = residual_base
+        self.init_spread_scale = float(init_spread_scale)
         self.head_dropout = head_dropout
-        self.mean_head = self._make_head(embed_dim, 2)
-        self.chol_head = self._make_head(embed_dim, 3)
-        # Learnable scalars, NOT module-level dropout-style toggles: each head's output is
-        # multiplied by its gate before being added to its base (see forward()). Starting
-        # small (residual_gate_init) keeps the fresh model close to the base ("start
-        # gentle") while the head itself is full-strength (Kaiming init, see _make_head)
-        # so gradients aren't suppressed -- only the gate scalar has to grow during
-        # training, not the whole head's weights from near-zero.
+        self.mean_head = self._make_head(embed_dim, 2)    # q50 (central) head
+        self.offset_head = self._make_head(embed_dim, 4)  # [raw_up_u, raw_up_v, raw_down_u, raw_down_v]
+        # Learnable scalar gates: each head's output is multiplied by its gate before being
+        # added to its base (see forward()). Starting small (residual_gate_init) keeps the
+        # fresh model close to its base ("start gentle") while the head itself is
+        # full-strength (Kaiming init) so gradients aren't suppressed.
         self.mean_gate = nn.Parameter(torch.tensor(float(residual_gate_init)))
-        self.chol_gate = nn.Parameter(torch.tensor(float(residual_gate_init)))
-
-        # Variance conditioning (config-gated, default OFF): a SEPARATE conv mapping the
-        # COND_CHANNELS conditioning features -> embed_dim, added to chol_head[0]'s output
-        # (see forward()). Zero-initialized (weight AND bias), so at init it is an exact
-        # no-op -- the conditioned model's output equals the unconditioned checkpoint's,
-        # letting us continue-from-checkpoint and let chol_cond learn during fine-tuning.
-        # cond_mean/cond_std standardize the conditioning channels (default no-op; set via
-        # load_cond_stats from precompute_prior_spread.py's training-set statistics).
-        self.variance_conditioning = bool(variance_conditioning)
-        if self.variance_conditioning:
-            self.chol_cond = nn.Conv2d(self.COND_CHANNELS, embed_dim, 3, 1, 1)
-            nn.init.zeros_(self.chol_cond.weight)
-            nn.init.zeros_(self.chol_cond.bias)
-            self.register_buffer("cond_mean", torch.zeros(1, self.COND_CHANNELS, 1, 1))
-            self.register_buffer("cond_std", torch.ones(1, self.COND_CHANNELS, 1, 1))
+        self.offset_gate = nn.Parameter(torch.tensor(float(residual_gate_init)))
 
     @staticmethod
     def _make_head(embed_dim: int, out_channels: int) -> nn.Sequential:
         # conv -> LeakyReLU -> conv. head_dropout (when > 0) is applied functionally in
-        # _head_forward between the activation and the final conv, NOT as a module here,
-        # so the state_dict layout is identical for every head_dropout value -- a
-        # checkpoint trained at one setting loads at any other (and an un-dropped run can
-        # be resumed with dropout turned on).
+        # _head_forward between activation and final conv, NOT as a module here, so the
+        # state_dict layout is identical for every head_dropout value.
         head = nn.Sequential(
             nn.Conv2d(embed_dim, embed_dim, 3, 1, 1),
             nn.LeakyReLU(negative_slope=LEAKY_SLOPE, inplace=True),
             nn.Conv2d(embed_dim, out_channels, 3, 1, 1),
         )
-        # Standard Kaiming-normal init on the final conv (NOT near-zero): the gate (see
-        # __init__) is what keeps a fresh model's contribution small, not a suppressed
-        # weight -- so this head is full-strength and gradients flow normally from step 0.
+        # Standard Kaiming-normal init on the final conv (NOT near-zero): the gate is what
+        # keeps a fresh model's contribution small, not a suppressed weight.
         nn.init.kaiming_normal_(head[-1].weight, a=LEAKY_SLOPE, nonlinearity="leaky_relu")
         nn.init.zeros_(head[-1].bias)
         return head
@@ -194,62 +170,33 @@ class ProbabilisticSwin2SR(Swin2SR):
     @classmethod
     def _inverse_softplus(cls, x: torch.Tensor) -> torch.Tensor:
         """Exact inverse of F.softplus (beta=1): softplus(inverse_softplus(x)) == x.
-        x is clamped to CHOL_EPS first so a (near-)zero base Cholesky entry doesn't blow
-        up log(0); log1p(-exp(-x)) is the numerically stable form of log(1 - exp(-x))."""
-        x = x.clamp_min(cls.CHOL_EPS)
+        x is clamped to SOFTPLUS_EPS first so a (near-)zero base doesn't blow up log(0);
+        log1p(-exp(-x)) is the numerically stable form of log(1 - exp(-x))."""
+        x = x.clamp_min(cls.SOFTPLUS_EPS)
         return x + torch.log1p(-torch.exp(-x))
 
-    def load_cond_stats(self, cond_mean, cond_std):
-        """Set the standardization buffers for the variance-conditioning features.
-        cond_mean/cond_std are length-COND_CHANNELS sequences (per-channel training-set
-        mean/std from precompute_prior_spread.py); reshaped to (1, C, 1, 1) for
-        broadcasting over (B, C, H, W). No-op unless variance_conditioning is on."""
-        if not self.variance_conditioning:
-            raise RuntimeError("load_cond_stats called but variance_conditioning is off")
-        mean = torch.as_tensor(cond_mean, dtype=self.cond_mean.dtype).reshape(1, self.COND_CHANNELS, 1, 1)
-        std = torch.as_tensor(cond_std, dtype=self.cond_std.dtype).reshape(1, self.COND_CHANNELS, 1, 1)
-        self.cond_mean.copy_(mean)
-        self.cond_std.copy_(std.clamp_min(self.GRAD_EPS))
+    def _enscgp_marginal_std(self, posterior: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-pixel MARGINAL std of the EnsCGP posterior for u and v, from its Cholesky
+        L (Sigma = L L^T): sigma_u = sqrt(Sigma_uu) = L11, sigma_v = sqrt(Sigma_vv) =
+        sqrt(L21^2 + L22^2). Returns (sigma_u, sigma_v), each (B, 1, H, W)."""
+        l11 = posterior[:, 2:3]
+        l21 = posterior[:, 3:4]
+        l22 = posterior[:, 4:5]
+        sigma_u = l11.clamp_min(0.0)
+        sigma_v = torch.sqrt(l21 ** 2 + l22 ** 2 + self.GRAD_EPS)
+        return sigma_u, sigma_v
 
-    def _speed_grad_mag(self, mean_out: torch.Tensor) -> torch.Tensor:
-        """|grad(speed)| of the predicted-mean wind speed, (B,1,H,W). Central differences
-        with replicate padding (same scheme as MeanAuxLosses.gradient). Caller passes the
-        DETACHED mean so this conditioning feature contributes no gradient to the mean
-        head/backbone."""
-        sp = torch.sqrt(mean_out[:, 0:1] ** 2 + mean_out[:, 1:2] ** 2 + self.GRAD_EPS)
-        sp_x = F.pad(sp, (1, 1, 0, 0), mode="replicate")
-        gx = 0.5 * (sp_x[:, :, :, 2:] - sp_x[:, :, :, :-2])
-        sp_y = F.pad(sp, (0, 0, 1, 1), mode="replicate")
-        gy = 0.5 * (sp_y[:, :, 2:, :] - sp_y[:, :, :-2, :])
-        return torch.sqrt(gx ** 2 + gy ** 2 + self.GRAD_EPS)
+    def _quantile_offset(self, sigma: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
+        """One non-negative, monotonic quantile offset: softplus of a gated perturbation in
+        inverse-softplus space around the scale*sigma base, floored by OFFSET_EPS. A fresh
+        model (small offset_gate) returns ~= scale*sigma; the offset is always > 0."""
+        base = self.init_spread_scale * sigma
+        return F.softplus(self._inverse_softplus(base) + self.offset_gate * raw) + self.OFFSET_EPS
 
-    def _terrain_grad_mag(self, terrain_raw: torch.Tensor) -> torch.Tensor:
-        """|terrain slope| = sqrt(u_slope^2 + v_slope^2) from terrain_raw[:,2:4] (the
-        u_slope_z/v_slope_z channels, see terrain_encoder.load_terrain_input), avg-pooled
-        5x from the 1000x1000 terrain grid to the 200x200 WRF grid. (1,1,H,W), static
-        across samples -- broadcast over the batch in forward()."""
-        slope = terrain_raw[:, 2:4]
-        mag = torch.sqrt(slope[:, 0:1] ** 2 + slope[:, 1:2] ** 2 + self.GRAD_EPS)
-        return F.avg_pool2d(mag, kernel_size=5, stride=5)
-
-    def _cond_features(self, prior_spread, mean_out, terrain_raw) -> torch.Tensor:
-        """Assemble + standardize the COND_CHANNELS conditioning features, padded to the
-        backbone's (check_image_size) resolution so they align with `feats`."""
-        if prior_spread is None:
-            raise ValueError("variance_conditioning is on but prior_spread was not provided to forward()")
-        ps = self.check_image_size(prior_spread)                                  # (B,2,Hp,Wp)
-        smg = self.check_image_size(self._speed_grad_mag(mean_out.detach()))      # (B,1,Hp,Wp)
-        tgm = self._terrain_grad_mag(terrain_raw)                                 # (1,1,H,W)
-        if tgm.shape[0] != ps.shape[0]:
-            tgm = tgm.expand(ps.shape[0], -1, -1, -1)
-        tgm = self.check_image_size(tgm)                                          # (B,1,Hp,Wp)
-        cond = torch.cat([ps, smg, tgm], dim=1)                                   # (B,COND_CHANNELS,Hp,Wp)
-        return (cond - self.cond_mean) / self.cond_std
-
-    def forward(self, posterior, bicubic, terrain_raw, prior_spread=None):
-        # Input decomposition: replace the EnsCGP u/v channels with the bicubic baseline
-        # and the EnsCGP-mean-minus-bicubic residual; keep the EnsCGP Cholesky channels.
-        # This is independent of residual_base (which only affects the OUTPUT bases below).
+    def forward(self, posterior, bicubic, terrain_raw):
+        # Input decomposition: replace the EnsCGP u/v channels with the bicubic baseline and
+        # the EnsCGP-mean-minus-bicubic residual; keep the EnsCGP Cholesky channels. This is
+        # independent of residual_base (which only affects the q50 OUTPUT base below).
         residual = posterior[:, :2] - bicubic
         model_input = torch.cat([bicubic, residual, posterior[:, 2:5]], dim=1)
 
@@ -261,8 +208,7 @@ class ProbabilisticSwin2SR(Swin2SR):
         H, W = x.shape[2:]
         x = self.check_image_size(x)
 
-        # Output bases. mean_base per residual_base; chol_base is always EnsCGP's own
-        # Cholesky channels (no bicubic/none analog for a covariance -- see docstring).
+        # q50 base per residual_base (same selection the old mean used).
         if self.residual_base == "enscgp":
             mean_base = posterior[:, :2]
         elif self.residual_base == "bicubic":
@@ -270,7 +216,11 @@ class ProbabilisticSwin2SR(Swin2SR):
         else:  # "none"
             mean_base = torch.zeros_like(bicubic)
         mean_base = self.check_image_size(mean_base)
-        chol_base = self.check_image_size(posterior[:, 2:5])
+
+        # EnsCGP per-pixel marginal std -> the offset base (padded to the backbone grid).
+        sigma_u, sigma_v = self._enscgp_marginal_std(posterior)
+        sigma_u = self.check_image_size(sigma_u)
+        sigma_v = self.check_image_size(sigma_v)
 
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
@@ -278,32 +228,19 @@ class ProbabilisticSwin2SR(Swin2SR):
         x_first = self.conv_first(x)
         feats = self.conv_after_body(self.forward_features(x_first)) + x_first
 
-        mean_residual = self._head_forward(self.mean_head, feats)
-        mean_out = mean_base + self.mean_gate * mean_residual
+        q50 = mean_base + self.mean_gate * self._head_forward(self.mean_head, feats)
 
-        # chol_head, optionally conditioned: chol_cond(cond) is added to the first conv's
-        # output (zero-init -> exact no-op when fresh / when conditioning is off). The rest
-        # of the head (activation, functional head_dropout, final conv) is unchanged, so
-        # chol_head's state_dict layout/weights are identical with or without conditioning.
-        chol_pre = self.chol_head[0](feats)
-        if self.variance_conditioning:
-            chol_pre = chol_pre + self.chol_cond(self._cond_features(prior_spread, mean_out, terrain_raw))
-        chol_pre = self.chol_head[1](chol_pre)  # LeakyReLU
-        if self.head_dropout > 0:
-            chol_pre = F.dropout2d(chol_pre, p=self.head_dropout, training=self.training)
-        chol_residual = self.chol_head[2](chol_pre)  # final conv
-        base_l11 = chol_base[:, 0:1]
-        base_l21 = chol_base[:, 1:2]
-        base_l22 = chol_base[:, 2:3]
-        # Diagonal: gate the perturbation in inverse-softplus (pre-activation) space around
-        # the base, then map back through softplus -- L11/L22 stay > 0 by construction
-        # regardless of how large the gated perturbation grows (no clamping needed).
-        l11 = F.softplus(self._inverse_softplus(base_l11) + self.chol_gate * chol_residual[:, 0:1])
-        l22 = F.softplus(self._inverse_softplus(base_l22) + self.chol_gate * chol_residual[:, 2:3])
-        l21 = base_l21 + self.chol_gate * chol_residual[:, 1:2]  # unconstrained: direct gated addition
-        chol = torch.cat([l11, l21, l22], dim=1)
+        raw = self._head_forward(self.offset_head, feats)  # [up_u, up_v, down_u, down_v]
+        up_u = self._quantile_offset(sigma_u, raw[:, 0:1])
+        up_v = self._quantile_offset(sigma_v, raw[:, 1:2])
+        down_u = self._quantile_offset(sigma_u, raw[:, 2:3])
+        down_v = self._quantile_offset(sigma_v, raw[:, 3:4])
+        up = torch.cat([up_u, up_v], dim=1)
+        down = torch.cat([down_u, down_v], dim=1)
 
-        out = torch.cat([mean_out, chol], dim=1)
+        q90 = q50 + up
+        q10 = q50 - down
+        out = torch.cat([q10, q50, q90], dim=1)  # (B, 6, Hp, Wp)
         return out[:, :, :H, :W]
 
 
@@ -314,9 +251,8 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict:
 
 def build_model(config: dict) -> ProbabilisticSwin2SR:
     m = config["model"]
-    # Dropout knobs default to current behavior, so omitting them from the config is a
-    # no-op: drop_rate/attn_drop_rate 0.0 and head_dropout 0.0 (off), drop_path_rate 0.1
-    # (the Swin2SR default the model already trained with). Raise them to regularize.
+    # Dropout knobs default to current behavior, so omitting them is a no-op:
+    # drop_rate/attn_drop_rate 0.0 and head_dropout 0.0 (off), drop_path_rate 0.1.
     return ProbabilisticSwin2SR(
         img_size=m.get("img_size", 200),
         embed_dim=m.get("embed_dim", 96),
@@ -326,12 +262,36 @@ def build_model(config: dict) -> ProbabilisticSwin2SR:
         mlp_ratio=m.get("mlp_ratio", 4.0),
         residual_base=m.get("residual_base", "enscgp"),
         residual_gate_init=m.get("residual_gate_init", 0.1),
+        init_spread_scale=m.get("init_spread_scale", 1.28),
         head_dropout=m.get("head_dropout", 0.0),
-        variance_conditioning=m.get("variance_conditioning", False),
         drop_rate=m.get("drop_rate", 0.0),
         attn_drop_rate=m.get("attn_drop_rate", 0.0),
         drop_path_rate=m.get("drop_path_rate", 0.1),
     )
+
+
+def _pinball_quantile_recovery_test():
+    """Unit test: the pinball(tau) minimizer over a fixed set of truths is the empirical
+    tau-quantile. Optimize a single scalar prediction against samples from a known
+    distribution and confirm it converges to the true 0.9 (and 0.1) quantile -- i.e. the
+    pinball loss is doing what we claim, independent of the network."""
+    torch.manual_seed(0)
+    y = torch.randn(200000)  # standard normal; known quantiles
+    for tau, truth in ((0.9, 1.2816), (0.1, -1.2816)):
+        q = torch.zeros(1, requires_grad=True)
+        opt = torch.optim.Adam([q], lr=0.05)
+        for _ in range(2000):
+            opt.zero_grad()
+            err = y - q
+            loss = torch.maximum(tau * err, (tau - 1.0) * err).mean()
+            loss.backward()
+            opt.step()
+        emp = torch.quantile(y, tau).item()
+        got = q.item()
+        assert abs(got - emp) < 0.03, f"tau={tau}: pinball minimizer {got:.4f} != empirical quantile {emp:.4f}"
+        assert abs(got - truth) < 0.05, f"tau={tau}: pinball minimizer {got:.4f} != true quantile {truth:.4f}"
+        print(f"  pinball tau={tau}: recovered {got:.4f} (empirical {emp:.4f}, true {truth:.4f})")
+    print("Pinball quantile-recovery test passed.")
 
 
 def _smoke_test(config: dict):
@@ -341,10 +301,8 @@ def _smoke_test(config: dict):
 
     img_size = config["model"].get("img_size", 200)
     posterior = torch.randn(2, ProbabilisticSwin2SR.POSTERIOR_CHANNELS, img_size, img_size)
-    # Real EnsCGP Cholesky diagonal (L11, L22) is always > 0 by construction; make the
-    # fabricated test data physically valid too (softplus maps randn -> a realistic
-    # positive spread) so the chol-tracking check below isn't comparing against an
-    # unphysical negative "base" that the model would have had to clamp anyway.
+    # Real EnsCGP Cholesky diagonal (L11, L22) is > 0 by construction; make the fabricated
+    # test data physically valid too (softplus maps randn -> a realistic positive spread).
     posterior[:, 2] = F.softplus(posterior[:, 2])
     posterior[:, 4] = F.softplus(posterior[:, 4])
     bicubic = torch.randn(2, 2, img_size, img_size)
@@ -353,72 +311,68 @@ def _smoke_test(config: dict):
     with torch.no_grad():
         out = model(posterior, bicubic, terrain_raw)
 
-    assert out.shape == (2, 5, img_size, img_size), f"unexpected output shape {out.shape}"
+    assert out.shape == (2, 6, img_size, img_size), f"unexpected output shape {out.shape}"
+    q10 = out[:, ProbabilisticSwin2SR.Q10_SLICE]
+    q50 = out[:, ProbabilisticSwin2SR.Q50_SLICE]
+    q90 = out[:, ProbabilisticSwin2SR.Q90_SLICE]
 
-    mu, l11, l21, l22 = out[:, :2], out[:, 2], out[:, 3], out[:, 4]
-    assert torch.all(l11 > 0), "L11 must be strictly positive"
-    assert torch.all(l22 > 0), "L22 must be strictly positive"
+    # Monotonicity by construction, everywhere, strictly (offsets floored by OFFSET_EPS).
+    assert torch.all(q10 <= q50), "q10 <= q50 violated"
+    assert torch.all(q50 <= q90), "q50 <= q90 violated"
+    up = (q90 - q50)
+    down = (q50 - q10)
+    assert torch.all(up >= model.OFFSET_EPS - 1e-6), "up offset underflowed OFFSET_EPS"
+    assert torch.all(down >= model.OFFSET_EPS - 1e-6), "down offset underflowed OFFSET_EPS"
 
-    # Fresh model: mean_out should track its base (gated by a small residual_gate_init,
-    # not a near-zero-init head -- so a moderate bound, not a tiny one). base depends on
-    # residual_base; default "enscgp" -> posterior mean.
+    # Fresh model: q50 tracks its residual_base within a gate-scaled margin; q10/q90 form a
+    # symmetric ~1.28*sigma_EnsCGP band around q50 (up ~= down ~= scale*sigma at init).
     base_map = {"enscgp": posterior[:, :2], "bicubic": bicubic, "none": torch.zeros_like(bicubic)}
     mean_base = base_map[model.residual_base]
     gate = model.mean_gate.item()
-    mean_diff = (mu - mean_base).abs().max().item()
-    bound = max(0.5, 5 * gate)  # gate*(head output, full-strength Kaiming-init, std~O(1))
+    mean_diff = (q50 - mean_base).abs().max().item()
+    bound = max(0.5, 5 * gate)
     assert mean_diff < bound, (
-        f"fresh model's mean_out should track its {model.residual_base!r} base within a "
-        f"gate-scaled margin (gate={gate:.3f}, bound={bound:.3f}), got max abs diff {mean_diff}"
+        f"fresh q50 should track its {model.residual_base!r} base within a gate-scaled "
+        f"margin (gate={gate:.3f}, bound={bound:.3f}), got {mean_diff:.4f}"
+    )
+    sigma_u, sigma_v = model._enscgp_marginal_std(posterior)
+    band_target = model.init_spread_scale * torch.cat([sigma_u, sigma_v], dim=1)
+    # offset_gate is small at init, so up/down ~= scale*sigma (softplus perturbation is
+    # gate-scaled). Loose bound: the gated perturbation term + OFFSET_EPS.
+    offset_gate = model.offset_gate.item()
+    band_bound = max(0.3, 5 * offset_gate) + model.OFFSET_EPS
+    up_diff = (up - band_target).abs().max().item()
+    down_diff = (down - band_target).abs().max().item()
+    assert up_diff < band_bound and down_diff < band_bound, (
+        f"fresh band should be ~= scale*sigma (offset_gate={offset_gate:.3f}, bound={band_bound:.3f}); "
+        f"got up_diff={up_diff:.4f}, down_diff={down_diff:.4f}"
     )
 
-    # Same check for chol: fresh L11/L22 should track the EnsCGP base Cholesky diagonal,
-    # L21 the base off-diagonal, within a gate-scaled margin. Diagonal channels compared
-    # against the CLAMPED base (matching what forward() actually inverts through softplus).
-    chol_base = torch.stack([
-        posterior[:, 2].clamp_min(ProbabilisticSwin2SR.CHOL_EPS),
-        posterior[:, 3],
-        posterior[:, 4].clamp_min(ProbabilisticSwin2SR.CHOL_EPS),
-    ], dim=1)
-    chol_gate = model.chol_gate.item()
-    chol_diff = (torch.stack([l11, l21, l22], dim=1) - chol_base).abs().max().item()
-    chol_bound = max(0.5, 5 * chol_gate)
-    assert chol_diff < chol_bound, (
-        f"fresh model's chol output should track the EnsCGP base within a gate-scaled "
-        f"margin (chol_gate={chol_gate:.3f}, bound={chol_bound:.3f}), got max abs diff {chol_diff}"
-    )
-
-    # Gradient sanity check: both heads' final convs are now full-strength (Kaiming init,
-    # not near-zero), so gradient should flow to the shared backbone strongly from step 0
-    # -- and the gates themselves must receive gradient (they're the thing training has to
-    # grow).
+    # Gradient sanity: heads are full-strength (Kaiming), so gradient flows to the backbone
+    # and terrain encoder strongly from step 0, and both gates receive gradient.
     model.zero_grad()
     out_grad = model(posterior, bicubic, terrain_raw)
     out_grad.pow(2).mean().backward()
     conv_first_grad = model.conv_first.weight.grad
-    assert conv_first_grad is not None, "conv_first.weight.grad is None -- backward() did not reach the backbone"
-    backbone_grad = conv_first_grad.abs().max().item()
-    assert backbone_grad > 0, "conv_first received zero gradient -- backbone is disconnected from the heads"
-
+    assert conv_first_grad is not None and conv_first_grad.abs().max().item() > 0, \
+        "conv_first received no gradient -- backbone disconnected from the heads"
     terrain_grad = model.terrain_encoder.stem[0].weight.grad
-    assert terrain_grad is not None, "terrain_encoder received no gradient"
-    assert terrain_grad.abs().max().item() > 0, "terrain_encoder received zero gradient"
-
-    assert model.mean_gate.grad is not None and model.mean_gate.grad.abs().item() > 0, "mean_gate received zero gradient"
-    assert model.chol_gate.grad is not None and model.chol_gate.grad.abs().item() > 0, "chol_gate received zero gradient"
+    assert terrain_grad is not None and terrain_grad.abs().max().item() > 0, "terrain_encoder received no gradient"
+    assert model.mean_gate.grad is not None and model.mean_gate.grad.abs().item() > 0, "mean_gate received no gradient"
+    assert model.offset_gate.grad is not None and model.offset_gate.grad.abs().item() > 0, "offset_gate received no gradient"
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Output shape: {tuple(out.shape)}")
-    print(f"residual_base={model.residual_base!r}, mean_gate={gate:.4f}, chol_gate={chol_gate:.4f}")
-    print(f"L11 range: [{l11.min().item():.4f}, {l11.max().item():.4f}]")
-    print(f"L22 range: [{l22.min().item():.4f}, {l22.max().item():.4f}]")
-    print(f"L21 range: [{l21.min().item():.4f}, {l21.max().item():.4f}]")
-    print(f"max|mean_out - {model.residual_base} base| (fresh model): {mean_diff:.4f} (bound {bound:.4f})")
-    print(f"max|chol_out - enscgp base| (fresh model): {chol_diff:.4f} (bound {chol_bound:.4f})")
-    print(f"conv_first weight grad max (backbone receives gradient): {backbone_grad:.2e}")
-    print(f"terrain_encoder weight grad max (trained jointly): {terrain_grad.abs().max().item():.2e}")
+    print(f"Output shape: {tuple(out.shape)}  (ordered [q10_u,q10_v, q50_u,q50_v, q90_u,q90_v])")
+    print(f"residual_base={model.residual_base!r}, init_spread_scale={model.init_spread_scale}, "
+          f"mean_gate={gate:.4f}, offset_gate={offset_gate:.4f}")
+    print(f"up  offset range: [{up.min().item():.4f}, {up.max().item():.4f}]")
+    print(f"down offset range: [{down.min().item():.4f}, {down.max().item():.4f}]")
+    print(f"max|q50 - {model.residual_base} base| (fresh): {mean_diff:.4f} (bound {bound:.4f})")
+    print(f"max|band - scale*sigma| (fresh): up {up_diff:.4f}, down {down_diff:.4f} (bound {band_bound:.4f})")
+    print(f"conv_first weight grad max: {conv_first_grad.abs().max().item():.2e}")
     print(f"Total parameters: {n_params:,}")
     print("Smoke test passed.")
+    _pinball_quantile_recovery_test()
 
 
 if __name__ == "__main__":

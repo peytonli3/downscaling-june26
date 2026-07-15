@@ -6,6 +6,63 @@ hyperparameters, training details) are not listed here.
 
 ---
 
+## 0714  *(scripts/new_enscgp_swin.py + scripts/train_new_enscgp_swin.py)*
+
+**Logs / checkpoints:** `runs/0714/`
+
+### Breaking changes from 0701
+
+Replaces the Gaussian (mean + 2×2 Cholesky) uncertainty head with **direct quantile
+prediction** (q10/q50/q90 per component). Wind is heavy-tailed/right-skewed, so a
+per-pixel Gaussian was a poor fit; quantiles are distribution-free and better for
+extremes.
+
+- **`chol_head` / `chol_gate` (3ch) → `offset_head` / `offset_gate` (4ch).** The head
+  now predicts two non-negative offsets per component `[raw_up_u, raw_up_v, raw_down_u,
+  raw_down_v]`. Old `chol_head.*` / `chol_gate` keys are gone; `offset_head.*` /
+  `offset_gate` are new → strict load fails.
+- **Output 5ch → 6ch**, ordered `[q10_u, q10_v, q50_u, q50_v, q90_u, q90_v]`
+  (`Q10_SLICE` / `Q50_SLICE` / `Q90_SLICE`).
+- **q50 = the old mean head, unchanged.** `mean_head` / `mean_gate` keep their shapes,
+  role, and `residual_base` selection, so they **transfer** from a 0701 checkpoint. q50
+  is what the structural losses train (stays sharp); it is *not* pinball-trained.
+- **Monotonic by construction:** `up/down = softplus(inv_softplus(scale·σ_EnsCGP) +
+  offset_gate·raw) + OFFSET_EPS`; `q90 = q50 + up`, `q10 = q50 − down` (⇒ q10 ≤ q50 ≤ q90,
+  no crossing). `σ_u = L11`, `σ_v = √(L21²+L22²)` are the EnsCGP marginal stds; a fresh
+  model emits `q50 ± 1.28σ` (the EnsCGP posterior as a symmetric 80% band).
+- **New model config:** `init_spread_scale` (default 1.28 ≈ Φ⁻¹(0.9)).
+- **`variance_conditioning` removed** (it conditioned the now-deleted Cholesky head):
+  `chol_cond`, `cond_mean`/`cond_std` buffers, and `load_cond_stats` are gone.
+- **`conv_first` unchanged** — still 7 input channels + 4 terrain = 11ch, so the
+  backbone/terrain encoder transfer cleanly.
+
+### Loss changes
+
+- **NLL removed.** Uncertainty is trained solely by
+  `pin_weight · [pinball(q90, .9) + pinball(q10, .1)]`.
+- **Extreme weighting** (config `extreme_weight{enabled, alpha, apply_to_q10}`, default on
+  for q90): per-pixel `1 + α·CDF(|truth|)`, detached and per-sample mean-normalized, so
+  rare high-wind peaks aren't smoothed out of q90.
+- Structural losses (multiscale/freq/l1/spectral/gradient) unchanged — now attach to q50.
+- Config: `nll_weight`/`quantile_weight`/`quantiles` removed; `pin_weight` +
+  `extreme_weight` added. **Coverage** metrics (q10/q50/q90 exceedance, overall + extreme
+  tail) added to `evaluate` as a post-hoc calibration check.
+
+### Continue-from-checkpoint
+
+`--resume-weights-only` now does a **partial, non-strict** load: it transfers only
+name+shape-matching tensors (backbone, conv_first, terrain_encoder, `mean_head`,
+`mean_gate`) from a 0701 checkpoint; `offset_head`/`offset_gate` start fresh and
+`chol_head`/`chol_gate` are dropped. Also supports fresh-from-EnsCGP (no `--resume`).
+
+**Parameter count:** 2,087,060.
+
+**Stale (not updated here):** `scripts/train_finetune_variance.py` and the Cholesky-
+consuming diagnostics in `extra_scripts/` targeted the old covariance head and will not
+work against a 0714 checkpoint — they need separate updates.
+
+---
+
 ## Repo reorganization (2026-07-13)
 
 Not a model change — repository structure only.

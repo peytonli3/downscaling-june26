@@ -13,17 +13,29 @@ Per sample:
           all samples, encoded by TerrainEncoder (terrain_encoder.py) -- a
           submodule of the model, trained jointly (not a frozen feature map).
 
-Loss = nll_weight * NLL(mu, Sigma=LL^T; wrf_uv)
-     + ms_weight * multiscale_loss(mu, wrf_uv)          [see multiscale_loss.py]
-     + l1_weight * L1(mu, wrf_uv)
-     + spectral_weight * high-freq spectral L1(mu, wrf_uv)
-     + gradient_weight * divergence L1(mu, wrf_uv)
-     + quantile_weight * pinball(mu, wrf_uv)
-All six weights are configurable ("training" section: nll_weight/ms_weight/l1_weight/
-spectral_weight/gradient_weight/quantile_weight). The Gaussian NLL is the only term that
-uses the predicted covariance (chol_head) -- multiscale_loss/l1/spectral/gradient/quantile
-are computed exclusively on the predicted mean (mu_u, mu_v) vs. wrf_uv, and must never be
-changed to touch the covariance (see multiscale_loss.py's tuning guardrail).
+Loss = ms_weight * multiscale_loss(q50, wrf_uv)          [see multiscale_loss.py]
+     + freq_weight * freq_band_loss(q50, wrf_uv)
+     + l1_weight * L1(q50, wrf_uv)
+     + spectral_weight * high-freq spectral L1(q50, wrf_uv)
+     + gradient_weight * divergence L1(q50, wrf_uv)
+     + pin_weight * [ pinball(q90, wrf_uv, 0.9) + pinball(q10, wrf_uv, 0.1) ]
+The STRUCTURAL / mean-supervision terms (ms/freq/l1/spectral/gradient) attach to q50 ONLY
+-- exactly the role the old predicted mean had -- so q50 stays sharp and displacement-
+tolerant. They must never be pointed at q10/q90 (an uncertainty envelope is not a wind
+field; matching its spectrum/texture is a category error) nor at the quantile spread.
+The uncertainty is trained SOLELY by the pinball (quantile) loss on q90/q10 -- the old
+Gaussian NLL and its Cholesky are gone. q50 is deliberately NOT pinball-trained (a
+pinball(0.5) term would pull it toward the blurry pointwise median and fight the
+structural losses). All weights are configurable ("training" section).
+
+Extreme weighting: rare high-wind pixels are a tiny fraction of the field, so an
+unweighted pinball under-trains them and q90 gets smoothed down off the damaging peaks.
+When training.extreme_weight.enabled, the q90 pinball (and, if apply_to_q10, the q10
+pinball) is multiplied by a per-pixel weight 1 + alpha * F(|truth|), where F is the
+per-sample empirical CDF (rank/N) of wind magnitude -- so peak pixels get up to ~(1+alpha)x
+weight. Weights are DETACHED (no gradient through the ranking) and mean-normalized per
+sample (so the loss scale is invariant to alpha). Calibration is checked post-hoc via
+coverage (see evaluate), NOT enforced by the loss.
 
 multiscale_loss (scripts/multiscale_loss.py) is now the PRIMARY mean-supervision term --
 a Laplacian-pyramid, displacement-tolerant (sliced-Wasserstein) loss built to replace the
@@ -31,9 +43,9 @@ legacy l1/spectral/gradient stack, which a per-band error diagnostic
 (extra_scripts/band_error_diagnostics.py) found rewards smoothing instead of correcting the
 dominant error mode (random spatial displacement at every scale). The active config
 ("new_enscgp_swin_config.json") sets l1_weight/spectral_weight/gradient_weight to 0.0 and
-ms_weight > 0 -- each weight is still independently toggleable/zeroable (e.g. to bisect back
-to the legacy stack, set ms_weight=0 and restore l1_weight=1.0 etc.). quantile_weight
-defaults to 0.0 (off) as before. The first time ms_weight > 0, this script precomputes and
+ms_weight > 0 -- each structural weight is still independently toggleable/zeroable (e.g. to
+bisect back to the legacy stack, set ms_weight=0 and restore l1_weight=1.0 etc.). The first
+time ms_weight > 0, this script precomputes and
 caches multiscale_loss's per-band sigma_band normalization over a sample of the training
 set (see multiscale_loss.load_or_compute_sigma_band) -- a one-time cost, not per-batch.
 
@@ -56,7 +68,6 @@ Usage:
 import argparse
 import json
 import logging
-import math
 from datetime import datetime
 from pathlib import Path
 
@@ -90,22 +101,20 @@ class EnsCGPSwinDataset(Dataset):
 
 
 class MeanAuxLosses:
-    """High-frequency spectral L1, divergence ("gradient") L1, and high-quantile pinball
-    losses computed exclusively on the predicted mean (mu_u, mu_v) vs. wrf_uv -- adapted
-    from WeightedWindLoss in 26.3_wind/SWIN/train_wind_swin2sr.py (its spectral_high/
-    sparse_grad/quantile terms only; this project's L1 and NLL already live in
-    compute_weighted_loss below, so are not duplicated here). Stateless aside from a
-    cache for the FFT frequency mask, which depends only on (H, W, device).
+    """High-frequency spectral L1 and divergence ("gradient") L1 computed exclusively on
+    q50 (the central field) vs. wrf_uv -- adapted from WeightedWindLoss in
+    26.3_wind/SWIN/train_wind_swin2sr.py (its spectral_high/sparse_grad terms). These are
+    STRUCTURAL terms on q50, kept alongside the primary multiscale/freq losses (all default
+    to weight 0 in the active config). The old mu-pinball ("quantile") term is gone: the
+    quantile heads (q10/q90) are trained by the pinball loss in compute_weighted_loss, and
+    q50 is deliberately not pinball-trained. Stateless aside from a cache for the FFT
+    frequency mask, which depends only on (H, W, device).
     """
 
-    def __init__(self, spectral_low_freq_cutoff: float = 0.28, quantiles: tuple[float, ...] = (0.95, 0.99)):
+    def __init__(self, spectral_low_freq_cutoff: float = 0.28):
         self.spectral_low_freq_cutoff = float(spectral_low_freq_cutoff)
         if not 0.0 < self.spectral_low_freq_cutoff < 1.0:
             raise ValueError(f"spectral_low_freq_cutoff must be in (0,1), got {self.spectral_low_freq_cutoff}")
-        self.quantiles = tuple(float(q) for q in quantiles)
-        for q in self.quantiles:
-            if q <= 0.0 or q >= 1.0:
-                raise ValueError(f"Quantiles must be in (0,1), got {q}")
         self._high_mask_cache: tuple | None = None  # (H, W, device) -> mask
 
     @staticmethod
@@ -150,72 +159,86 @@ class MeanAuxLosses:
             return u_x + v_y
         return torch.mean(torch.abs(divergence(mu) - divergence(target)))
 
-    def quantile(self, mu: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Mean pinball (quantile) loss over self.quantiles: asymmetrically penalizes mu
-        for under-predicting the q-th quantile of the (u, v) error more than over-
-        predicting it, biasing mu toward the upper tail for high q."""
-        if not self.quantiles:
-            return torch.tensor(0.0, device=mu.device, dtype=mu.dtype)
-        err = target - mu
-        losses = [torch.mean(torch.maximum((q - 1.0) * err, q * err)) for q in self.quantiles]
-        return torch.mean(torch.stack(losses))
+
+def extreme_pixel_weights(target: torch.Tensor, alpha: float, eps: float = 1e-6) -> torch.Tensor:
+    """Per-pixel weight 1 + alpha * F(|truth|), F = per-sample empirical CDF (rank/(N-1))
+    of wind magnitude |truth| = sqrt(u^2 + v^2). Peak-wind pixels approach weight (1+alpha);
+    bulk pixels ~1. DETACHED (no gradient through the ranking) and mean-normalized per
+    sample so the loss scale is invariant to alpha. Returns (B, 1, H, W)."""
+    with torch.no_grad():
+        mag = torch.sqrt(target[:, 0:1] ** 2 + target[:, 1:2] ** 2 + eps)  # (B,1,H,W)
+        B = mag.shape[0]
+        flat = mag.reshape(B, -1)
+        n = flat.shape[1]
+        # empirical CDF via double-argsort ranks in [0, 1]
+        ranks = flat.argsort(dim=1).argsort(dim=1).to(mag.dtype)
+        cdf = ranks / max(n - 1, 1)
+        w = 1.0 + alpha * cdf.reshape_as(mag)
+        w = w / w.mean(dim=(1, 2, 3), keepdim=True)  # mean-normalize per sample
+    return w
+
+
+def pinball_loss(q: torch.Tensor, target: torch.Tensor, tau: float,
+                 weight: torch.Tensor | None = None) -> torch.Tensor:
+    """Mean pinball (tilted-L1) loss for quantile level tau: err = target - q;
+    loss = max(tau*err, (tau-1)*err) per pixel (== tau*err if target>q else (1-tau)*(q-target)).
+    Fully differentiable in q. weight (B,1,H,W) broadcasts over the u/v channels if given."""
+    err = target - q
+    loss = torch.maximum(tau * err, (tau - 1.0) * err)  # (B, 2, H, W)
+    if weight is not None:
+        loss = loss * weight
+    return loss.mean()
 
 
 def compute_weighted_loss(pred: torch.Tensor, target: torch.Tensor, weights: dict, mean_aux: MeanAuxLosses,
                            ms_loss_fn: MultiscaleLoss | None = None,
                            freq_loss_fn: FreqBandLoss | None = None,
-                           eps: float = 1e-6) -> dict:
-    """pred: (B,5,H,W) [mu_u,mu_v,L11,L21,L22]; target: (B,2,H,W) [u,v].
-    weights: {"nll","ms","l1","spectral","gradient","quantile"} -> float.
+                           extreme_cfg: dict | None = None) -> dict:
+    """pred: (B,6,H,W) [q10_u,q10_v, q50_u,q50_v, q90_u,q90_v]; target: (B,2,H,W) [u,v].
+    weights: {"ms","freq","l1","spectral","gradient","pin"} -> float.
 
-    NLL is the exact bivariate-Gaussian negative log-likelihood under Sigma = L @ L.T,
-    solved via the 2x2 lower-triangular system L z = (target - mu) rather than forming
-    Sigma^-1 directly. Split into its two data-dependent terms (det(L) = L11*L22 since L
-    is lower-triangular; log(2*pi) is a constant, folded into `nll` only):
-      logdet      = log(L11) + log(L22)  = 0.5 * log(det(Sigma))
-      mahalanobis = 0.5 * (z1^2 + z2^2)  = 0.5 * (target-mu)^T Sigma^-1 (target-mu)
-      nll = logdet + mahalanobis + log(2*pi)
-    multiscale_loss/spectral/gradient/quantile (see multiscale_loss.py / MeanAuxLosses) use
-    mu only, never the covariance. ms_loss_fn is None when ms_weight==0 (no precompute, no
-    per-batch cost) -- see train()'s startup.
+    Structural terms (ms/freq/l1/spectral/gradient) attach to q50 ONLY (see multiscale_loss.py
+    / MeanAuxLosses) -- q50 keeps the old mean's role and stays sharp. Uncertainty is trained
+    only by pinball(q90, .9) + pinball(q10, .1). ms_loss_fn/freq_loss_fn are None when their
+    weight is 0 (no precompute, no per-batch cost) -- see train()'s startup.
 
-    Returns a dict with every component (all detached except "total", which carries the
-    graph for backward()).
+    extreme_cfg (or None = off): {"enabled": bool, "alpha": float, "apply_to_q10": bool}.
+    When enabled, up-weights high-wind pixels in the q90 pinball (and q10 if apply_to_q10).
+
+    Returns a dict with every component (all detached except "total", which carries the graph).
     """
-    mu = pred[:, :2]
-    L11 = pred[:, 2].clamp_min(eps)
-    L21 = pred[:, 3]
-    L22 = pred[:, 4].clamp_min(eps)
+    q10 = pred[:, ProbabilisticSwin2SR.Q10_SLICE]
+    q50 = pred[:, ProbabilisticSwin2SR.Q50_SLICE]
+    q90 = pred[:, ProbabilisticSwin2SR.Q90_SLICE]
 
-    e1 = target[:, 0] - mu[:, 0]
-    e2 = target[:, 1] - mu[:, 1]
-    z1 = e1 / L11
-    z2 = (e2 - L21 * z1) / L22
+    ms = ms_loss_fn(q50, target) if ms_loss_fn is not None else pred.new_zeros(())
+    freq = freq_loss_fn(q50, target) if freq_loss_fn is not None else pred.new_zeros(())
+    l1 = F.l1_loss(q50, target)
+    spectral = mean_aux.spectral(q50, target)
+    gradient = mean_aux.gradient(q50, target)
 
-    logdet = (torch.log(L11) + torch.log(L22)).mean()
-    mahalanobis = (0.5 * (z1 ** 2 + z2 ** 2)).mean()
-    nll = logdet + mahalanobis + math.log(2 * math.pi)
-    ms = ms_loss_fn(mu, target) if ms_loss_fn is not None else pred.new_zeros(())
-    freq = freq_loss_fn(mu, target) if freq_loss_fn is not None else pred.new_zeros(())
-    l1 = F.l1_loss(mu, target)
-    spectral = mean_aux.spectral(mu, target)
-    gradient = mean_aux.gradient(mu, target)
-    quantile = mean_aux.quantile(mu, target)
+    w90 = w10 = None
+    if extreme_cfg is not None and extreme_cfg.get("enabled", False):
+        w90 = extreme_pixel_weights(target, extreme_cfg.get("alpha", 1.0))
+        if extreme_cfg.get("apply_to_q10", False):
+            w10 = w90
+    pin90 = pinball_loss(q90, target, 0.9, w90)
+    pin10 = pinball_loss(q10, target, 0.1, w10)
+    pin = pin90 + pin10
 
     total = (
-        weights["nll"] * nll
-        + weights["ms"] * ms
+        weights["ms"] * ms
         + weights["freq"] * freq
         + weights["l1"] * l1
         + weights["spectral"] * spectral
         + weights["gradient"] * gradient
-        + weights["quantile"] * quantile
+        + weights["pin"] * pin
     )
     return {
         "total": total,
-        "nll": nll.detach(), "ms": ms.detach(), "freq": freq.detach(), "l1": l1.detach(),
-        "logdet": logdet.detach(), "mahalanobis": mahalanobis.detach(),
-        "spectral": spectral.detach(), "gradient": gradient.detach(), "quantile": quantile.detach(),
+        "ms": ms.detach(), "freq": freq.detach(), "l1": l1.detach(),
+        "spectral": spectral.detach(), "gradient": gradient.detach(),
+        "pin": pin.detach(), "pin90": pin90.detach(), "pin10": pin10.detach(),
     }
 
 
@@ -244,29 +267,65 @@ def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, best_va
     }, path)
 
 
-LOSS_COMPONENT_KEYS = ("total", "nll", "ms", "freq", "l1", "logdet", "mahalanobis", "spectral", "gradient", "quantile")
+LOSS_COMPONENT_KEYS = ("total", "ms", "freq", "l1", "spectral", "gradient", "pin", "pin90", "pin10")
+# Coverage = fraction of truth pixels at or below each predicted quantile (target nominal
+# in parentheses). "_ext" variants restrict to the extreme tail (|wind| above its per-sample
+# 90th percentile) -- the damage-relevant region where q90 must actually reach the peaks.
+COVERAGE_KEYS = ("cov_q10", "cov_q50", "cov_q90", "cov_q10_ext", "cov_q50_ext", "cov_q90_ext")
+NOMINAL_COVERAGE = {"cov_q10": 0.10, "cov_q50": 0.50, "cov_q90": 0.90}
+
+
+@torch.no_grad()
+def coverage_metrics(pred: torch.Tensor, target: torch.Tensor, ext_quantile: float = 0.9) -> dict:
+    """Empirical coverage: fraction of truth (u,v) pixels <= each predicted quantile, both
+    overall and within the extreme tail (|wind| above its per-sample ext_quantile). A
+    calibrated model has cov_q10~=.10, cov_q50~=.50, cov_q90~=.90. Post-hoc CHECK, not a loss.
+    Returns per-key (count_below, count_total) so a running total can be aggregated exactly."""
+    q10 = pred[:, ProbabilisticSwin2SR.Q10_SLICE]
+    q50 = pred[:, ProbabilisticSwin2SR.Q50_SLICE]
+    q90 = pred[:, ProbabilisticSwin2SR.Q90_SLICE]
+    below = {"cov_q10": (target <= q10), "cov_q50": (target <= q50), "cov_q90": (target <= q90)}
+
+    mag = torch.sqrt(target[:, 0:1] ** 2 + target[:, 1:2] ** 2 + 1e-6)   # (B,1,H,W)
+    thresh = torch.quantile(mag.reshape(mag.shape[0], -1), ext_quantile, dim=1)  # (B,)
+    ext = (mag >= thresh.reshape(-1, 1, 1, 1)).expand_as(q50)             # (B,2,H,W)
+
+    out = {}
+    for base, mask in below.items():
+        out[base] = (mask.sum().item(), mask.numel())
+        out[base + "_ext"] = ((mask & ext).sum().item(), ext.sum().item())
+    return out
 
 
 @torch.no_grad()
 def evaluate(model, loader, terrain_raw, device, weights: dict, mean_aux: MeanAuxLosses,
              ms_loss_fn: MultiscaleLoss | None = None,
-             freq_loss_fn: FreqBandLoss | None = None) -> dict:
-    """Returns per-sample-averaged loss components (see compute_weighted_loss)."""
+             freq_loss_fn: FreqBandLoss | None = None,
+             extreme_cfg: dict | None = None) -> dict:
+    """Returns per-sample-averaged loss components plus empirical coverage (see
+    compute_weighted_loss / coverage_metrics)."""
     model.eval()
     totals = {k: 0.0 for k in LOSS_COMPONENT_KEYS}
+    cov_below = {k: 0 for k in COVERAGE_KEYS}
+    cov_total = {k: 0 for k in COVERAGE_KEYS}
     n = 0
     for posterior, bicubic, wrf in loader:
         posterior = posterior.to(device, non_blocking=True)
         bicubic = bicubic.to(device, non_blocking=True)
         wrf = wrf.to(device, non_blocking=True)
         pred = model(posterior, bicubic, terrain_raw)
-        loss_dict = compute_weighted_loss(pred, wrf, weights, mean_aux, ms_loss_fn, freq_loss_fn)
+        loss_dict = compute_weighted_loss(pred, wrf, weights, mean_aux, ms_loss_fn, freq_loss_fn, extreme_cfg)
         b = posterior.shape[0]
         for k in LOSS_COMPONENT_KEYS:
             totals[k] += loss_dict[k].item() * b
+        for k, (below, tot) in coverage_metrics(pred, wrf).items():
+            cov_below[k] += below
+            cov_total[k] += tot
         n += b
     model.train()
-    return {k: v / n for k, v in totals.items()}
+    out = {k: v / n for k, v in totals.items()}
+    out.update({k: (cov_below[k] / cov_total[k] if cov_total[k] else float("nan")) for k in COVERAGE_KEYS})
+    return out
 
 
 def train(config: dict, device_str: str, resume_path: Path | None = None,
@@ -329,10 +388,24 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
 
     if resume_path is not None:
         ckpt = torch.load(resume_path, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
         if resume_weights_only:
-            logger.info("Loaded weights from %s (weights-only: optimizer/scheduler/epoch reset)", resume_path)
+            # PARTIAL, non-strict load: transfer only tensors whose name AND shape match
+            # (backbone, conv_first, terrain_encoder, mean_head/mean_gate). This is how a
+            # Gaussian/Cholesky checkpoint seeds the quantile model -- q50 inherits the old
+            # mean head; the new offset_head/offset_gate start fresh, and the dropped
+            # chol_head/chol_gate are simply not loaded.
+            model_sd = model.state_dict()
+            filtered = {k: v for k, v in ckpt["model_state_dict"].items()
+                        if k in model_sd and v.shape == model_sd[k].shape}
+            fresh = sorted(k for k in model_sd if k not in filtered)
+            dropped = sorted(k for k in ckpt["model_state_dict"] if k not in model_sd)
+            model.load_state_dict(filtered, strict=False)
+            logger.info("Partial weights-only load from %s: transferred %d/%d tensors.",
+                        resume_path, len(filtered), len(model_sd))
+            logger.info("  Fresh (not in checkpoint): %s", fresh)
+            logger.info("  Dropped (not in model): %s", dropped)
         else:
+            model.load_state_dict(ckpt["model_state_dict"])
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
             start_epoch = ckpt["epoch"] + 1
@@ -340,23 +413,17 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
             logger.info("Resumed from %s at epoch %d (best_val_loss=%.5f)", resume_path, start_epoch, best_val_loss)
 
     weights = {
-        "nll": t.get("nll_weight", 1.0),
         "ms": t.get("ms_weight", 0.0),
         "freq": t.get("freq_weight", 0.0),
-        "l1": t.get("l1_weight", 1.0),
+        "l1": t.get("l1_weight", 0.0),
         "spectral": t.get("spectral_weight", 0.0),
         "gradient": t.get("gradient_weight", 0.0),
-        "quantile": t.get("quantile_weight", 0.0),
+        "pin": t.get("pin_weight", 1.0),
     }
-    mean_aux = MeanAuxLosses(
-        spectral_low_freq_cutoff=t.get("spectral_low_freq_cutoff", 0.28),
-        quantiles=tuple(t.get("quantiles", [0.95, 0.99])),
-    )
+    extreme_cfg = t.get("extreme_weight", {"enabled": True, "alpha": 1.5, "apply_to_q10": False})
+    mean_aux = MeanAuxLosses(spectral_low_freq_cutoff=t.get("spectral_low_freq_cutoff", 0.28))
     logger.info("Loss weights: %s", weights)
-    logger.info(
-        "Mean-aux loss params: spectral_low_freq_cutoff=%.3f, quantiles=%s",
-        mean_aux.spectral_low_freq_cutoff, list(mean_aux.quantiles),
-    )
+    logger.info("Extreme weighting: %s", extreme_cfg)
 
     # multiscale_loss: only precompute/build when ms_weight > 0, so it's a true no-op (no
     # sigma_band precompute cost) when off -- see multiscale_loss.py's module docstring for
@@ -420,7 +487,7 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
             wrf = wrf.to(device, non_blocking=True)
 
             pred = model(posterior, bicubic, terrain_raw)
-            loss_dict = compute_weighted_loss(pred, wrf, weights, mean_aux, ms_loss_fn, freq_loss_fn)
+            loss_dict = compute_weighted_loss(pred, wrf, weights, mean_aux, ms_loss_fn, freq_loss_fn, extreme_cfg)
             loss = loss_dict["total"]
 
             optimizer.zero_grad()
@@ -436,14 +503,14 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
 
             if (i + 1) % log_every == 0:
                 logger.info(
-                    "Epoch %d | Batch %d/%d | Loss %.5f (NLL %.5f [logdet %.5f, mahal %.5f], MS %.5f, Freq %.5f, "
-                    "L1 %.5f, Spectral %.5f, Gradient %.5f, Quantile %.5f) | LR %.2e",
+                    "Epoch %d | Batch %d/%d | Loss %.5f (Pin %.5f [q90 %.5f, q10 %.5f], MS %.5f, Freq %.5f, "
+                    "L1 %.5f, Spectral %.5f, Gradient %.5f) | LR %.2e",
                     epoch, i + 1, len(train_loader),
-                    running["total"] / log_every, running["nll"] / log_every,
-                    running["logdet"] / log_every, running["mahalanobis"] / log_every,
+                    running["total"] / log_every, running["pin"] / log_every,
+                    running["pin90"] / log_every, running["pin10"] / log_every,
                     running["ms"] / log_every, running["freq"] / log_every,
                     running["l1"] / log_every, running["spectral"] / log_every,
-                    running["gradient"] / log_every, running["quantile"] / log_every,
+                    running["gradient"] / log_every,
                     scheduler.get_last_lr()[0],
                 )
                 running = {k: 0.0 for k in LOSS_COMPONENT_KEYS}
@@ -453,14 +520,21 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
                 return
 
         if (epoch + 1) % val_interval == 0:
-            val_metrics = evaluate(model, val_loader, terrain_raw, device, weights, mean_aux, ms_loss_fn, freq_loss_fn)
+            val_metrics = evaluate(model, val_loader, terrain_raw, device, weights, mean_aux,
+                                   ms_loss_fn, freq_loss_fn, extreme_cfg)
             val_loss = val_metrics["total"]
             logger.info(
-                "Epoch %d | Val Loss %.5f (NLL %.5f [logdet %.5f, mahal %.5f], MS %.5f, Freq %.5f, "
-                "L1 %.5f, Spectral %.5f, Gradient %.5f, Quantile %.5f)",
-                epoch, val_loss, val_metrics["nll"], val_metrics["logdet"], val_metrics["mahalanobis"],
+                "Epoch %d | Val Loss %.5f (Pin %.5f [q90 %.5f, q10 %.5f], MS %.5f, Freq %.5f, "
+                "L1 %.5f, Spectral %.5f, Gradient %.5f)",
+                epoch, val_loss, val_metrics["pin"], val_metrics["pin90"], val_metrics["pin10"],
                 val_metrics["ms"], val_metrics["freq"],
-                val_metrics["l1"], val_metrics["spectral"], val_metrics["gradient"], val_metrics["quantile"],
+                val_metrics["l1"], val_metrics["spectral"], val_metrics["gradient"],
+            )
+            logger.info(
+                "Epoch %d | Coverage q10/q50/q90 = %.3f/%.3f/%.3f (nominal .10/.50/.90) | "
+                "extreme tail = %.3f/%.3f/%.3f",
+                epoch, val_metrics["cov_q10"], val_metrics["cov_q50"], val_metrics["cov_q90"],
+                val_metrics["cov_q10_ext"], val_metrics["cov_q50_ext"], val_metrics["cov_q90_ext"],
             )
 
             save_checkpoint(checkpoint_dir / "last.pth", model, optimizer, scheduler, epoch, best_val_loss)
