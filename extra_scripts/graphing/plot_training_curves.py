@@ -16,8 +16,9 @@ automatically. Logs that cannot be joined to any other are plotted as separate l
 
 Layout (4 panels, shared x-axis), or just panel 1 with --no_components:
   1. Val total loss (+ optional train total loss with --show_train)
-  2. Pinball decomposition: total pinball, q90 pinball, q10 pinball
-  3. Structural components (weighted): MS, Freq, L1, Spectral, Gradient
+  2. Pinball decomposition: mean of the q90/q10 pinball (kept close to the two component
+     lines rather than their sum), q90 pinball, q10 pinball
+  3. Structural components (weighted): MS, Freq, L1
   4. Coverage: empirical fraction of truth <= q10/q50/q90, overall (solid) and in the
      extreme tail (dashed), with nominal .10/.50/.90 reference lines. This is the
      calibration read: q90 should sit near 0.90, q10 near 0.10.
@@ -289,20 +290,24 @@ def plot_curves(merged_runs: list[dict], show_train: bool, show_components: bool
 
         if show_components:
             # ── panel 2: pinball decomposition ──
-            for key, ls, disp in (("pin", "-", "Pin (total)"), ("q90", "--", "q90"), ("q10", (0, (5, 2)), "q10")):
-                arr = _field(val, key)
-                if arr is not None:
-                    ax_pin.plot(epochs, arr, color=color, linestyle=ls, linewidth=1.5, label=f"{disp} [{label}]")
+            # Aggregate line is the MEAN of the q90/q10 pinball (not their sum), so it sits
+            # among the two component lines rather than at ~2x their level.
+            q90_arr, q10_arr = _field(val, "q90"), _field(val, "q10")
+            if q90_arr is not None and q10_arr is not None:
+                ax_pin.plot(epochs, 0.5 * (q90_arr + q10_arr), color=color, linestyle="-",
+                            linewidth=1.5, label=f"Pin (mean q10,q90) [{label}]")
+            if q90_arr is not None:
+                ax_pin.plot(epochs, q90_arr, color=color, linestyle="--", linewidth=1.5, label=f"q90 [{label}]")
+            if q10_arr is not None:
+                ax_pin.plot(epochs, q10_arr, color=color, linestyle=(0, (5, 2)), linewidth=1.5, label=f"q10 [{label}]")
             for ep in best:
                 ax_pin.axvline(ep, color=color, linewidth=0.7, linestyle=":", alpha=0.7)
 
             # ── panel 3: structural components ──
             struct_styles = {
-                "ms":       ("-",  1.4, "MS"),
-                "freq":     ("--", 1.4, "Freq"),
-                "l1":       ((0, (5, 2)), 1.2, "L1"),
-                "spectral": ("-.", 1.2, "Spectral"),
-                "gradient": (":",  1.2, "Gradient"),
+                "ms":   ("-",  1.4, "MS"),
+                "freq": ("--", 1.4, "Freq"),
+                "l1":   ((0, (5, 2)), 1.2, "L1"),
             }
             for key, (ls, lw, disp) in struct_styles.items():
                 arr = _field(val, key)
