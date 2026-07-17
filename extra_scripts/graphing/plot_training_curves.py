@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
 """
-Plot training curves (val loss and components) from train_new_enscgp_swin.py log files.
+Plot training curves (val loss and components) from train_new_enscgp_swin.py log files
+(0714+ quantile format: pinball loss + q10/q50/q90 coverage; the pre-0714 NLL/Cholesky log
+format is no longer parsed).
 
 Auto-join: when a log says "Resumed from ... at epoch N", the script finds another
 parsed log whose val records end at (or include) epoch N and stitches them into a
 continuous curve -- data before epoch N comes from the predecessor, data from N onward
-comes from the resumed log. Overlapping epochs (e.g. the resumed log re-runs epoch 41)
-use the resumed log's values.
+comes from the resumed log. Overlapping epochs use the resumed log's values. (A
+weights-only / architecture-change start logs no "Resumed from" line, so it correctly
+begins a fresh chain at epoch 0 rather than joining a prior run.)
 
 Without --no_auto_join, all logs in --log_dir (or --logs) are parsed and chained
-automatically. Logs that cannot be joined to any other (either because they stand
-alone or because their predecessor isn't in the set) are plotted as separate lines.
+automatically. Logs that cannot be joined to any other are plotted as separate lines.
 
-Layout (3 panels, same x-axis):
+Layout (4 panels, shared x-axis), or just panel 1 with --no_components:
   1. Val total loss (+ optional train total loss with --show_train)
-  2. NLL decomposition: logdet and mahalanobis distance
-  3. Weighted auxiliary components: MS, L1, spectral, gradient, quantile
+  2. Pinball decomposition: total pinball, q90 pinball, q10 pinball
+  3. Structural components (weighted): MS, Freq, L1, Spectral, Gradient
+  4. Coverage: empirical fraction of truth <= q10/q50/q90, overall (solid) and in the
+     extreme tail (dashed), with nominal .10/.50/.90 reference lines. This is the
+     calibration read: q90 should sit near 0.90, q10 near 0.10.
 
-Best-val epochs are marked with vertical dashed lines. Use --no_components to show
-only panel 1 (single-panel output).
+Best-val epochs are marked with vertical dashed lines.
 
 Usage:
-    python plot_training_curves.py
-    python plot_training_curves.py --log_dir /home/peytonli/26.6_wind/logs
-    python plot_training_curves.py --logs train_20260628_113032.log train_20260628_194244.log
+    python plot_training_curves.py --logs /home/peytonli/26.6_wind/runs/0714/train_20260714_235959.log
+    python plot_training_curves.py --log_dir /home/peytonli/26.6_wind/runs/0714
     python plot_training_curves.py --logs a.log b.log --no_auto_join
     python plot_training_curves.py --show_train --no_components
 """
@@ -46,59 +49,56 @@ from new_enscgp_swin import DEFAULT_CONFIG_PATH, load_config  # noqa: E402
 
 # ── regex patterns ────────────────────────────────────────────────────────────
 
-_F = r"([\d.]+)"   # float group
+_F = r"([\d.]+)"          # positive float group
+_C = r"(nan|[\d.]+)"      # coverage value (may be nan if a stratum is empty)
 
-VAL_RE = re.compile(
-    r"Epoch (\d+) \| Val Loss " + _F +
-    r" \(NLL " + _F + r" \[logdet " + _F + r", mahal " + _F + r"\]"
-    r"(?:, MS " + _F + r")?"
-    r"(?:, Freq " + _F + r")?"
-    r", L1 " + _F + r", Spectral " + _F + r", Gradient " + _F + r", Quantile " + _F + r"\)"
+_LOSS_BODY = (
+    r" \(Pin " + _F + r" \[q90 " + _F + r", q10 " + _F + r"\]"
+    r", MS " + _F + r", Freq " + _F + r", L1 " + _F + r", Spectral " + _F + r", Gradient " + _F + r"\)"
 )
 
-TRAIN_RE = re.compile(
-    r"Epoch (\d+) \| Batch \d+/\d+ \| Loss " + _F +
-    r" \(NLL " + _F + r" \[logdet " + _F + r", mahal " + _F + r"\]"
-    r"(?:, MS " + _F + r")?"
-    r"(?:, Freq " + _F + r")?"
-    r", L1 " + _F + r", Spectral " + _F + r", Gradient " + _F + r", Quantile " + _F + r"\)"
-    r" \| LR " + r"([\d.e+\-]+)"
+VAL_RE = re.compile(r"Epoch (\d+) \| Val Loss " + _F + _LOSS_BODY)
+TRAIN_RE = re.compile(r"Epoch (\d+) \| Batch \d+/\d+ \| Loss " + _F + _LOSS_BODY + r" \| LR ([\d.e+\-]+)")
+COVERAGE_RE = re.compile(
+    r"Epoch (\d+) \| Coverage q10/q50/q90 = " + _C + r"/" + _C + r"/" + _C +
+    r" \(nominal .10/.50/.90\) \| extreme tail = " + _C + r"/" + _C + r"/" + _C
 )
-
 RESUME_RE = re.compile(r"Resumed from (.+) at epoch (\d+) \(best_val_loss=" + _F + r"\)")
 BEST_RE = re.compile(r"New best val loss: " + _F)
 
 
 # ── data structures ───────────────────────────────────────────────────────────
 
-FIELDS = ("total", "nll", "logdet", "mahal", "ms", "freq", "l1", "spectral", "gradient", "quantile")
+# Loss components present in both train and val lines.
+FIELDS = ("total", "pin", "q90", "q10", "ms", "freq", "l1", "spectral", "gradient")
+# Coverage fields (val lines only); attached to the matching val record.
+COVERAGE_FIELDS = ("cov_q10", "cov_q50", "cov_q90", "cov_q10_ext", "cov_q50_ext", "cov_q90_ext")
+
+
+def _loss_fields(groups: tuple) -> dict:
+    """Map the 9 captured loss groups (total, pin, q90, q10, ms, freq, l1, spectral,
+    gradient) to a dict."""
+    total, pin, q90, q10, ms, freq, l1, spectral, gradient = groups
+    return {
+        "total": float(total), "pin": float(pin), "q90": float(q90), "q10": float(q10),
+        "ms": float(ms), "freq": float(freq), "l1": float(l1),
+        "spectral": float(spectral), "gradient": float(gradient),
+    }
 
 
 def _val_rec(m: re.Match) -> dict:
-    epoch, total, nll, logdet, mahal, ms, freq, l1, spectral, gradient, quantile = m.groups()
-    return {
-        "epoch": int(epoch),
-        "total": float(total), "nll": float(nll),
-        "logdet": float(logdet), "mahal": float(mahal),
-        "ms": float(ms) if ms is not None else None,
-        "freq": float(freq) if freq is not None else None,
-        "l1": float(l1), "spectral": float(spectral),
-        "gradient": float(gradient), "quantile": float(quantile),
-    }
+    rec = {"epoch": int(m.group(1))}
+    rec.update(_loss_fields(m.groups()[1:]))
+    rec.update({k: None for k in COVERAGE_FIELDS})  # filled in by the following Coverage line
+    return rec
 
 
 def _train_rec(m: re.Match) -> dict:
-    epoch, total, nll, logdet, mahal, ms, freq, l1, spectral, gradient, quantile, lr = m.groups()
-    return {
-        "epoch": int(epoch),
-        "total": float(total), "nll": float(nll),
-        "logdet": float(logdet), "mahal": float(mahal),
-        "ms": float(ms) if ms is not None else None,
-        "freq": float(freq) if freq is not None else None,
-        "l1": float(l1), "spectral": float(spectral),
-        "gradient": float(gradient), "quantile": float(quantile),
-        "lr": float(lr),
-    }
+    rec = {"epoch": int(m.group(1))}
+    groups = m.groups()
+    rec.update(_loss_fields(groups[1:-1]))
+    rec["lr"] = float(groups[-1])
+    return rec
 
 
 class LogData:
@@ -128,6 +128,12 @@ def parse_log(path: Path) -> LogData:
                 log.resume_epoch = int(m.group(2))
             elif (m := VAL_RE.search(line)):
                 log.val.append(_val_rec(m))
+            elif (m := COVERAGE_RE.search(line)):
+                # Logged immediately after its Val Loss line, same epoch -- attach to it.
+                ep = int(m.group(1))
+                if log.val and log.val[-1]["epoch"] == ep:
+                    vals = [float(g) for g in m.groups()[1:]]
+                    log.val[-1].update(dict(zip(COVERAGE_FIELDS, vals)))
             elif (m := TRAIN_RE.search(line)):
                 r = _train_rec(m)
                 log.train_batches[r["epoch"]].append(r)
@@ -235,6 +241,8 @@ def merge_chain(chain: list[LogData]) -> dict:
 # ── plotting ──────────────────────────────────────────────────────────────────
 
 COLORS = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+# Fixed colors per quantile level for the coverage panel (independent of the per-run color).
+Q_COVERAGE = (("cov_q10", 0.10, "C0", "q10"), ("cov_q50", 0.50, "0.4", "q50"), ("cov_q90", 0.90, "C3", "q90"))
 
 
 def _epochs(records: list[dict]) -> np.ndarray:
@@ -249,15 +257,17 @@ def _field(records: list[dict], key: str) -> np.ndarray | None:
 
 
 def plot_curves(merged_runs: list[dict], show_train: bool, show_components: bool, output: Path) -> None:
-    n_panels = 3 if show_components else 1
-    fig, axes = plt.subplots(n_panels, 1, figsize=(11, 3.5 * n_panels), sharex=True,
+    n_panels = 4 if show_components else 1
+    fig, axes = plt.subplots(n_panels, 1, figsize=(11, 3.3 * n_panels), sharex=True,
                              gridspec_kw={"hspace": 0.08})
     if n_panels == 1:
         axes = [axes]
 
     ax_total = axes[0]
-    ax_nll = axes[1] if show_components else None
-    ax_aux = axes[2] if show_components else None
+    ax_pin = axes[1] if show_components else None
+    ax_struct = axes[2] if show_components else None
+    ax_cov = axes[3] if show_components else None
+    multi_run = len(merged_runs) > 1
 
     for run_idx, run in enumerate(merged_runs):
         color = COLORS[run_idx % len(COLORS)]
@@ -274,52 +284,64 @@ def plot_curves(merged_runs: list[dict], show_train: bool, show_components: bool
             tr_total = np.array([train[e]["total"] for e in tr_epochs])
             ax_total.plot(tr_epochs, tr_total, color=color, linewidth=0.8, alpha=0.4,
                           linestyle="--", label=f"{label} (train)")
-
         for ep in best:
             ax_total.axvline(ep, color=color, linewidth=0.7, linestyle=":", alpha=0.7)
 
         if show_components:
-            # ── panel 2: NLL decomposition ──
-            logdet = _field(val, "logdet")
-            mahal = _field(val, "mahal")
-            if logdet is not None:
-                ax_nll.plot(epochs, logdet, color=color, linewidth=1.5, label=f"logdet [{label}]")
-            if mahal is not None:
-                ax_nll.plot(epochs, mahal, color=color, linewidth=1.5, linestyle="--",
-                            label=f"mahal [{label}]")
+            # ── panel 2: pinball decomposition ──
+            for key, ls, disp in (("pin", "-", "Pin (total)"), ("q90", "--", "q90"), ("q10", (0, (5, 2)), "q10")):
+                arr = _field(val, key)
+                if arr is not None:
+                    ax_pin.plot(epochs, arr, color=color, linestyle=ls, linewidth=1.5, label=f"{disp} [{label}]")
             for ep in best:
-                ax_nll.axvline(ep, color=color, linewidth=0.7, linestyle=":", alpha=0.7)
+                ax_pin.axvline(ep, color=color, linewidth=0.7, linestyle=":", alpha=0.7)
 
-            # ── panel 3: aux components ──
-            aux_styles = {
+            # ── panel 3: structural components ──
+            struct_styles = {
                 "ms":       ("-",  1.4, "MS"),
                 "freq":     ("--", 1.4, "Freq"),
                 "l1":       ((0, (5, 2)), 1.2, "L1"),
                 "spectral": ("-.", 1.2, "Spectral"),
                 "gradient": (":",  1.2, "Gradient"),
-                "quantile": ((0, (3, 1, 1, 1)), 1.2, "Quantile"),
             }
-            for key, (ls, lw, display) in aux_styles.items():
+            for key, (ls, lw, disp) in struct_styles.items():
                 arr = _field(val, key)
                 if arr is not None:
-                    ax_aux.plot(epochs, arr, color=color, linestyle=ls, linewidth=lw,
-                                label=f"{display} [{label}]")
+                    ax_struct.plot(epochs, arr, color=color, linestyle=ls, linewidth=lw, label=f"{disp} [{label}]")
             for ep in best:
-                ax_aux.axvline(ep, color=color, linewidth=0.7, linestyle=":", alpha=0.7)
+                ax_struct.axvline(ep, color=color, linewidth=0.7, linestyle=":", alpha=0.7)
+
+            # ── panel 4: coverage (colored by quantile level, not by run) ──
+            prefix = f"{label}: " if multi_run else ""
+            for key, _nominal, qcolor, qname in Q_COVERAGE:
+                arr = _field(val, key)
+                if arr is not None:
+                    ax_cov.plot(epochs, arr, color=qcolor, linewidth=1.6, label=f"{prefix}{qname}")
+                arr_ext = _field(val, key + "_ext")
+                if arr_ext is not None:
+                    ax_cov.plot(epochs, arr_ext, color=qcolor, linewidth=1.2, linestyle="--", alpha=0.8,
+                                label=f"{prefix}{qname} (extreme)")
 
     # ── formatting ──
     ax_total.set_ylabel("Val total loss")
     ax_total.legend(fontsize=7, loc="upper right")
     ax_total.grid(True, which="both", alpha=0.3)
 
-    if show_components and ax_nll is not None and ax_aux is not None:
-        ax_nll.set_ylabel("NLL components")
-        ax_nll.legend(fontsize=6, loc="upper right")
-        ax_nll.grid(True, which="both", alpha=0.3)
+    if show_components:
+        ax_pin.set_ylabel("Pinball (val)")
+        ax_pin.legend(fontsize=6, loc="upper right", ncol=2)
+        ax_pin.grid(True, which="both", alpha=0.3)
 
-        ax_aux.set_ylabel("Aux components (weighted)")
-        ax_aux.legend(fontsize=6, loc="upper right", ncol=2)
-        ax_aux.grid(True, which="both", alpha=0.3)
+        ax_struct.set_ylabel("Structural (weighted, val)")
+        ax_struct.legend(fontsize=6, loc="upper right", ncol=2)
+        ax_struct.grid(True, which="both", alpha=0.3)
+
+        for _key, nominal, qcolor, _qname in Q_COVERAGE:
+            ax_cov.axhline(nominal, color=qcolor, linewidth=0.8, linestyle=":", alpha=0.5)
+        ax_cov.set_ylabel("Coverage (fraction ≤ q)")
+        ax_cov.set_ylim(0.0, 1.0)
+        ax_cov.legend(fontsize=6, loc="center right", ncol=2)
+        ax_cov.grid(True, which="both", alpha=0.3)
 
     axes[-1].set_xlabel("Epoch")
     fig.suptitle("Training curves", fontsize=13)
@@ -344,9 +366,9 @@ def main() -> None:
     parser.add_argument("--show_train", action="store_true",
                         help="Overlay per-epoch averaged train loss (dashed, lighter)")
     parser.add_argument("--no_components", action="store_true",
-                        help="Show only the total-loss panel (no NLL/aux breakdowns)")
+                        help="Show only the total val-loss panel (no pinball/structural/coverage breakdowns)")
     parser.add_argument("--output", type=Path, default=None,
-                        help="Output PNG path; defaults to <log_dir>/training_curves.png")
+                        help="Output PNG path; defaults to <log_dir>/figures/training_curves.png")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -361,7 +383,7 @@ def main() -> None:
         print(f"No log files found in {log_dir}. Use --logs to specify files explicitly.")
         sys.exit(1)
 
-    output = args.output or (log_dir / "training_curves.png")
+    output = args.output or (log_dir / "figures" / "training_curves.png")
 
     print(f"Parsing {len(log_paths)} log file(s)...")
     logs = []
@@ -373,7 +395,7 @@ def main() -> None:
         if n_val > 0:
             logs.append(log)
         else:
-            print(f"    (skipped — no val loss entries)")
+            print(f"    (skipped — no val loss entries; is this a pre-0714 log?)")
 
     if not logs:
         print("No usable log data found.")
@@ -385,8 +407,7 @@ def main() -> None:
         chains = build_chains(logs)
         runs = [merge_chain(chain) for chain in chains]
         for run in runs:
-            joined = run["label"]
-            print(f"  Chain: {joined} ({len(run['val'])} val epochs total)")
+            print(f"  Chain: {run['label']} ({len(run['val'])} val epochs total)")
 
     plot_curves(runs, show_train=args.show_train, show_components=not args.no_components, output=output)
 
