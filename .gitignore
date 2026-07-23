@@ -24,3 +24,6 @@ __pycache__/
 
 # On-disk archive of dead artifacts (recoverable code is in git tags)
 _archive/
+
+# Generated presentation binaries
+*.pptx
