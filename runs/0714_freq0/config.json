@@ -2,7 +2,7 @@
   "seed": 0,
   "paths": {
     "data_dir": "/home/peytonli/26.6_wind/data",
-    "log_dir": "/home/peytonli/26.6_wind/runs/0714",
+    "log_dir": "/home/peytonli/26.6_wind/runs/0714_freq0",
     "splits_path": "/home/peytonli/26.6_wind/data/splits_70_15_15/split_indices.npz"
   },
   "model": {
@@ -27,7 +27,7 @@
     "weight_decay": 0.0001,
     "pin_weight": 1.0,
     "ms_weight": 1.0,
-    "freq_weight": 0.5,
+    "freq_weight": 0.0,
     "l1_weight": 0.0,
     "spectral_weight": 0.0,
     "gradient_weight": 0.0,

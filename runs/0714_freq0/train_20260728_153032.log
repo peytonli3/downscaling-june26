@@ -1,0 +1,191 @@
+2026-07-28 15:30:32,543 INFO Logging to /home/peytonli/26.6_wind/runs/0714_freq0/train_20260728_153032.log
+2026-07-28 15:30:32,543 INFO Config:
+{
+  "seed": 0,
+  "paths": {
+    "data_dir": "/home/peytonli/26.6_wind/data",
+    "log_dir": "/home/peytonli/26.6_wind/runs/0714_freq0",
+    "splits_path": "/home/peytonli/26.6_wind/data/splits_70_15_15/split_indices.npz"
+  },
+  "model": {
+    "img_size": 200,
+    "embed_dim": 96,
+    "depths": [
+      4,
+      4,
+      4
+    ],
+    "num_heads": [
+      6,
+      6,
+      6
+    ],
+    "window_size": 8,
+    "mlp_ratio": 4.0,
+    "residual_base": "bicubic",
+    "residual_gate_init": 0.1,
+    "init_spread_scale": 1.28,
+    "drop_rate": 0.05,
+    "attn_drop_rate": 0.05,
+    "drop_path_rate": 0.1,
+    "head_dropout": 0.15
+  },
+  "training": {
+    "batch_size": 4,
+    "num_epochs": 100,
+    "learning_rate": 1e-05,
+    "weight_decay": 0.0001,
+    "pin_weight": 1.0,
+    "ms_weight": 1.0,
+    "freq_weight": 0.0,
+    "l1_weight": 0.0,
+    "spectral_weight": 0.0,
+    "gradient_weight": 0.0,
+    "spectral_low_freq_cutoff": 0.28,
+    "extreme_weight": {
+      "enabled": true,
+      "alpha": 2.0,
+      "apply_to_q10": true
+    },
+    "multiscale": {
+      "n_levels": 5,
+      "base_sigma": 2,
+      "metric_per_band": [
+        "l1",
+        "sw",
+        "sw",
+        "sw",
+        "sw"
+      ],
+      "metric_scale": {
+        "l1": 1.0,
+        "sw": 2.75
+      },
+      "patch_size": 8,
+      "patch_stride": 4,
+      "n_projections": 64,
+      "sigma_floor": 0.001,
+      "sigma_max_samples": 2000,
+      "histogram_weight": 0.0,
+      "force_recompute_sigma_band": false
+    },
+    "freq_band": {
+      "n_levels": 5,
+      "base_sigma": 2,
+      "cdf_weight_mode": "down_extremes",
+      "sigma_floor": 0.001,
+      "sigma_max_samples": 2000,
+      "force_recompute_sigma_band": false
+    },
+    "grad_clip_norm": 1.0,
+    "num_workers": 2,
+    "val_interval": 1,
+    "early_stop_patience": 8,
+    "lr_milestone_fractions": [
+      0.5,
+      0.75,
+      0.9
+    ],
+    "lr_gamma": 0.5
+  },
+  "logging": {
+    "log_every": 50
+  }
+}
+2026-07-28 15:30:32,544 INFO Using device: cuda
+2026-07-28 15:30:32,546 INFO Train samples: 4744, Val samples: 1013
+2026-07-28 15:30:32,964 INFO Total parameters: 2087060
+2026-07-28 15:30:32,965 INFO LR schedule: milestones (steps) = [59300, 88950, 106740] (of 118600 total), gamma = 0.500
+2026-07-28 15:30:32,965 INFO Loss weights: {'ms': 1.0, 'freq': 0.0, 'l1': 0.0, 'spectral': 0.0, 'gradient': 0.0, 'pin': 1.0}
+2026-07-28 15:30:32,965 INFO Extreme weighting: {'enabled': True, 'alpha': 2.0, 'apply_to_q10': True}
+2026-07-28 15:30:32,966 INFO multiscale_loss enabled: n_levels=5, base_sigma=2.00, metric_per_band=('l1', 'sw', 'sw', 'sw', 'sw'), metric_scale={'l1': 1.0, 'sw': 2.75}, sigma_band=[[0.698416531085968, 0.7594446539878845], [0.3979477286338806, 0.42225831747055054], [0.5279598236083984, 0.5658146739006042], [0.80471271276474, 0.8782278895378113], [5.570250034332275, 5.404760837554932]]
+2026-07-28 15:30:57,020 INFO Epoch 0 | Batch 50/1186 | Loss 7.85983 (Pin 1.08142 [q90 0.52994, q10 0.55148], MS 6.77842, Freq 0.00000, L1 2.00539, Spectral 0.32385, Gradient 0.47919) | LR 1.00e-05
+2026-07-28 15:31:18,747 INFO Epoch 0 | Batch 100/1186 | Loss 7.60578 (Pin 1.13468 [q90 0.55505, q10 0.57963], MS 6.47110, Freq 0.00000, L1 2.11428, Spectral 0.33378, Gradient 0.49212) | LR 1.00e-05
+2026-07-28 15:31:40,475 INFO Epoch 0 | Batch 150/1186 | Loss 6.30305 (Pin 1.08032 [q90 0.52680, q10 0.55351], MS 5.22274, Freq 0.00000, L1 2.06028, Spectral 0.32062, Gradient 0.49268) | LR 1.00e-05
+2026-07-28 15:32:02,196 INFO Epoch 0 | Batch 200/1186 | Loss 4.89443 (Pin 1.13733 [q90 0.55632, q10 0.58101], MS 3.75710, Freq 0.00000, L1 2.16570, Spectral 0.33530, Gradient 0.55872) | LR 1.00e-05
+2026-07-28 15:32:23,949 INFO Epoch 0 | Batch 250/1186 | Loss 4.59183 (Pin 1.15500 [q90 0.55892, q10 0.59608], MS 3.43683, Freq 0.00000, L1 2.23661, Spectral 0.33741, Gradient 0.58391) | LR 1.00e-05
+2026-07-28 15:32:45,676 INFO Epoch 0 | Batch 300/1186 | Loss 4.39992 (Pin 1.15366 [q90 0.56381, q10 0.58985], MS 3.24626, Freq 0.00000, L1 2.23807, Spectral 0.34204, Gradient 0.60967) | LR 1.00e-05
+2026-07-28 15:33:07,414 INFO Epoch 0 | Batch 350/1186 | Loss 4.41491 (Pin 1.15509 [q90 0.57014, q10 0.58496], MS 3.25982, Freq 0.00000, L1 2.27359, Spectral 0.34804, Gradient 0.62818) | LR 1.00e-05
+2026-07-28 15:33:29,168 INFO Epoch 0 | Batch 400/1186 | Loss 4.13649 (Pin 1.18043 [q90 0.56525, q10 0.61519], MS 2.95605, Freq 0.00000, L1 2.31364, Spectral 0.33971, Gradient 0.62149) | LR 1.00e-05
+2026-07-28 15:33:50,902 INFO Epoch 0 | Batch 450/1186 | Loss 4.03641 (Pin 1.16425 [q90 0.55032, q10 0.61393], MS 2.87216, Freq 0.00000, L1 2.29855, Spectral 0.33553, Gradient 0.62350) | LR 1.00e-05
+2026-07-28 15:34:12,643 INFO Epoch 0 | Batch 500/1186 | Loss 4.17921 (Pin 1.17955 [q90 0.56446, q10 0.61509], MS 2.99966, Freq 0.00000, L1 2.36072, Spectral 0.34757, Gradient 0.63619) | LR 1.00e-05
+2026-07-28 15:34:34,380 INFO Epoch 0 | Batch 550/1186 | Loss 4.13828 (Pin 1.19096 [q90 0.57520, q10 0.61576], MS 2.94732, Freq 0.00000, L1 2.40973, Spectral 0.35114, Gradient 0.65544) | LR 1.00e-05
+2026-07-28 15:34:56,108 INFO Epoch 0 | Batch 600/1186 | Loss 3.84888 (Pin 1.13825 [q90 0.55904, q10 0.57921], MS 2.71063, Freq 0.00000, L1 2.34435, Spectral 0.35145, Gradient 0.64556) | LR 1.00e-05
+2026-07-28 15:35:17,841 INFO Epoch 0 | Batch 650/1186 | Loss 3.85644 (Pin 1.13972 [q90 0.55819, q10 0.58153], MS 2.71672, Freq 0.00000, L1 2.33139, Spectral 0.35210, Gradient 0.64009) | LR 1.00e-05
+2026-07-28 15:35:39,571 INFO Epoch 0 | Batch 700/1186 | Loss 3.76369 (Pin 1.10073 [q90 0.53336, q10 0.56737], MS 2.66296, Freq 0.00000, L1 2.31341, Spectral 0.34470, Gradient 0.63377) | LR 1.00e-05
+2026-07-28 15:36:01,302 INFO Epoch 0 | Batch 750/1186 | Loss 3.67821 (Pin 1.07520 [q90 0.52954, q10 0.54566], MS 2.60301, Freq 0.00000, L1 2.27861, Spectral 0.35767, Gradient 0.65449) | LR 1.00e-05
+2026-07-28 15:36:23,039 INFO Epoch 0 | Batch 800/1186 | Loss 3.88429 (Pin 1.11237 [q90 0.54206, q10 0.57032], MS 2.77192, Freq 0.00000, L1 2.33394, Spectral 0.36174, Gradient 0.66845) | LR 1.00e-05
+2026-07-28 15:36:44,783 INFO Epoch 0 | Batch 850/1186 | Loss 3.56066 (Pin 1.11738 [q90 0.53834, q10 0.57904], MS 2.44328, Freq 0.00000, L1 2.32575, Spectral 0.34743, Gradient 0.64077) | LR 1.00e-05
+2026-07-28 15:37:06,527 INFO Epoch 0 | Batch 900/1186 | Loss 3.69806 (Pin 1.16046 [q90 0.55630, q10 0.60416], MS 2.53761, Freq 0.00000, L1 2.44506, Spectral 0.36472, Gradient 0.67022) | LR 1.00e-05
+2026-07-28 15:37:28,256 INFO Epoch 0 | Batch 950/1186 | Loss 3.61880 (Pin 1.10647 [q90 0.53591, q10 0.57056], MS 2.51234, Freq 0.00000, L1 2.34783, Spectral 0.35297, Gradient 0.65834) | LR 1.00e-05
+2026-07-28 15:37:49,982 INFO Epoch 0 | Batch 1000/1186 | Loss 3.46934 (Pin 1.10320 [q90 0.53452, q10 0.56869], MS 2.36614, Freq 0.00000, L1 2.32150, Spectral 0.35486, Gradient 0.64520) | LR 1.00e-05
+2026-07-28 15:38:11,723 INFO Epoch 0 | Batch 1050/1186 | Loss 3.38781 (Pin 1.05045 [q90 0.50814, q10 0.54232], MS 2.33736, Freq 0.00000, L1 2.25586, Spectral 0.34819, Gradient 0.63626) | LR 1.00e-05
+2026-07-28 15:38:33,476 INFO Epoch 0 | Batch 1100/1186 | Loss 3.35203 (Pin 1.05621 [q90 0.52111, q10 0.53510], MS 2.29581, Freq 0.00000, L1 2.26338, Spectral 0.34956, Gradient 0.64296) | LR 1.00e-05
+2026-07-28 15:38:55,221 INFO Epoch 0 | Batch 1150/1186 | Loss 3.37275 (Pin 1.02532 [q90 0.49170, q10 0.53361], MS 2.34743, Freq 0.00000, L1 2.17794, Spectral 0.35284, Gradient 0.64674) | LR 1.00e-05
+2026-07-28 15:39:47,161 INFO Epoch 0 | Val Loss 4.04365 (Pin 1.00019 [q90 0.47777, q10 0.52242], MS 3.04346, Freq 0.00000, L1 2.21826, Spectral 0.34326, Gradient 0.62704)
+2026-07-28 15:39:47,162 INFO Epoch 0 | Coverage q10/q50/q90 = 0.094/0.495/0.893 (nominal .10/.50/.90) | extreme tail = 0.107/0.495/0.884
+2026-07-28 15:39:47,445 INFO New best val loss: 4.04365 (saved checkpoints/best.pth)
+2026-07-28 15:40:09,271 INFO Epoch 1 | Batch 50/1186 | Loss 3.32945 (Pin 1.03652 [q90 0.50960, q10 0.52691], MS 2.29293, Freq 0.00000, L1 2.26745, Spectral 0.36428, Gradient 0.65809) | LR 1.00e-05
+2026-07-28 15:40:31,044 INFO Epoch 1 | Batch 100/1186 | Loss 3.36988 (Pin 1.05597 [q90 0.50938, q10 0.54659], MS 2.31392, Freq 0.00000, L1 2.25218, Spectral 0.35712, Gradient 0.64948) | LR 1.00e-05
+2026-07-28 15:40:52,792 INFO Epoch 1 | Batch 150/1186 | Loss 3.12368 (Pin 1.02985 [q90 0.49982, q10 0.53004], MS 2.09383, Freq 0.00000, L1 2.22806, Spectral 0.36081, Gradient 0.65092) | LR 1.00e-05
+2026-07-28 15:41:14,560 INFO Epoch 1 | Batch 200/1186 | Loss 3.20532 (Pin 1.08258 [q90 0.52633, q10 0.55624], MS 2.12275, Freq 0.00000, L1 2.29854, Spectral 0.36731, Gradient 0.65932) | LR 1.00e-05
+2026-07-28 15:41:36,315 INFO Epoch 1 | Batch 250/1186 | Loss 3.36633 (Pin 1.09342 [q90 0.52098, q10 0.57244], MS 2.27291, Freq 0.00000, L1 2.33298, Spectral 0.36606, Gradient 0.66504) | LR 1.00e-05
+2026-07-28 15:41:58,071 INFO Epoch 1 | Batch 300/1186 | Loss 3.33784 (Pin 1.04212 [q90 0.49230, q10 0.54982], MS 2.29571, Freq 0.00000, L1 2.24582, Spectral 0.36155, Gradient 0.65955) | LR 1.00e-05
+2026-07-28 15:42:19,835 INFO Epoch 1 | Batch 350/1186 | Loss 3.20349 (Pin 1.02737 [q90 0.49615, q10 0.53122], MS 2.17612, Freq 0.00000, L1 2.20910, Spectral 0.36577, Gradient 0.65429) | LR 1.00e-05
+2026-07-28 15:42:41,600 INFO Epoch 1 | Batch 400/1186 | Loss 3.40196 (Pin 1.08079 [q90 0.52312, q10 0.55767], MS 2.32117, Freq 0.00000, L1 2.31054, Spectral 0.36073, Gradient 0.65904) | LR 1.00e-05
+2026-07-28 15:43:03,356 INFO Epoch 1 | Batch 450/1186 | Loss 3.20572 (Pin 1.02787 [q90 0.49668, q10 0.53119], MS 2.17785, Freq 0.00000, L1 2.21218, Spectral 0.35803, Gradient 0.64213) | LR 1.00e-05
+2026-07-28 15:43:25,113 INFO Epoch 1 | Batch 500/1186 | Loss 3.35135 (Pin 1.07440 [q90 0.51461, q10 0.55978], MS 2.27695, Freq 0.00000, L1 2.29140, Spectral 0.36800, Gradient 0.66760) | LR 1.00e-05
+2026-07-28 15:43:46,877 INFO Epoch 1 | Batch 550/1186 | Loss 3.16950 (Pin 1.04477 [q90 0.50470, q10 0.54007], MS 2.12473, Freq 0.00000, L1 2.27069, Spectral 0.37161, Gradient 0.67798) | LR 1.00e-05
+2026-07-28 15:44:08,644 INFO Epoch 1 | Batch 600/1186 | Loss 3.12857 (Pin 1.05343 [q90 0.51369, q10 0.53974], MS 2.07514, Freq 0.00000, L1 2.26852, Spectral 0.35874, Gradient 0.64921) | LR 1.00e-05
+2026-07-28 15:44:30,400 INFO Epoch 1 | Batch 650/1186 | Loss 3.16519 (Pin 1.01790 [q90 0.49642, q10 0.52148], MS 2.14729, Freq 0.00000, L1 2.25263, Spectral 0.38191, Gradient 0.68487) | LR 1.00e-05
+2026-07-28 15:44:52,162 INFO Epoch 1 | Batch 700/1186 | Loss 3.34890 (Pin 1.03135 [q90 0.50270, q10 0.52865], MS 2.31755, Freq 0.00000, L1 2.27669, Spectral 0.39433, Gradient 0.70635) | LR 1.00e-05
+2026-07-28 15:45:13,916 INFO Epoch 1 | Batch 750/1186 | Loss 3.16938 (Pin 1.03001 [q90 0.48985, q10 0.54016], MS 2.13937, Freq 0.00000, L1 2.28577, Spectral 0.40510, Gradient 0.70890) | LR 1.00e-05
+2026-07-28 15:45:35,669 INFO Epoch 1 | Batch 800/1186 | Loss 2.96568 (Pin 0.98327 [q90 0.47348, q10 0.50979], MS 1.98240, Freq 0.00000, L1 2.17905, Spectral 0.36251, Gradient 0.65123) | LR 1.00e-05
+2026-07-28 15:45:57,421 INFO Epoch 1 | Batch 850/1186 | Loss 3.05396 (Pin 1.05385 [q90 0.50366, q10 0.55019], MS 2.00010, Freq 0.00000, L1 2.27278, Spectral 0.37049, Gradient 0.66411) | LR 1.00e-05
+2026-07-28 15:46:19,192 INFO Epoch 1 | Batch 900/1186 | Loss 3.08023 (Pin 1.03160 [q90 0.49693, q10 0.53467], MS 2.04863, Freq 0.00000, L1 2.24822, Spectral 0.37411, Gradient 0.67985) | LR 1.00e-05
+2026-07-28 15:46:40,957 INFO Epoch 1 | Batch 950/1186 | Loss 3.14224 (Pin 1.03590 [q90 0.50452, q10 0.53138], MS 2.10634, Freq 0.00000, L1 2.27427, Spectral 0.38009, Gradient 0.68503) | LR 1.00e-05
+2026-07-28 15:47:02,721 INFO Epoch 1 | Batch 1000/1186 | Loss 3.09776 (Pin 1.01144 [q90 0.48951, q10 0.52193], MS 2.08632, Freq 0.00000, L1 2.24775, Spectral 0.37178, Gradient 0.67704) | LR 1.00e-05
+2026-07-28 15:47:24,470 INFO Epoch 1 | Batch 1050/1186 | Loss 3.07781 (Pin 1.02570 [q90 0.49609, q10 0.52962], MS 2.05210, Freq 0.00000, L1 2.26240, Spectral 0.36758, Gradient 0.67176) | LR 1.00e-05
+2026-07-28 15:47:46,221 INFO Epoch 1 | Batch 1100/1186 | Loss 3.15232 (Pin 0.96860 [q90 0.46978, q10 0.49882], MS 2.18372, Freq 0.00000, L1 2.17169, Spectral 0.38039, Gradient 0.67387) | LR 1.00e-05
+2026-07-28 15:48:07,974 INFO Epoch 1 | Batch 1150/1186 | Loss 3.28301 (Pin 1.04311 [q90 0.50217, q10 0.54094], MS 2.23990, Freq 0.00000, L1 2.28557, Spectral 0.37685, Gradient 0.67565) | LR 1.00e-05
+2026-07-28 15:48:59,734 INFO Epoch 1 | Val Loss 3.73322 (Pin 0.95191 [q90 0.45632, q10 0.49559], MS 2.78131, Freq 0.00000, L1 2.14663, Spectral 0.35182, Gradient 0.62642)
+2026-07-28 15:48:59,735 INFO Epoch 1 | Coverage q10/q50/q90 = 0.075/0.484/0.900 (nominal .10/.50/.90) | extreme tail = 0.107/0.468/0.856
+2026-07-28 15:49:00,070 INFO New best val loss: 3.73322 (saved checkpoints/best.pth)
+2026-07-28 15:49:21,896 INFO Epoch 2 | Batch 50/1186 | Loss 3.00798 (Pin 1.01192 [q90 0.48789, q10 0.52403], MS 1.99606, Freq 0.00000, L1 2.22497, Spectral 0.37603, Gradient 0.67675) | LR 1.00e-05
+2026-07-28 15:49:43,653 INFO Epoch 2 | Batch 100/1186 | Loss 2.97711 (Pin 1.01845 [q90 0.49085, q10 0.52760], MS 1.95866, Freq 0.00000, L1 2.25003, Spectral 0.37307, Gradient 0.67054) | LR 1.00e-05
+2026-07-28 15:50:05,426 INFO Epoch 2 | Batch 150/1186 | Loss 3.05379 (Pin 1.01351 [q90 0.49445, q10 0.51906], MS 2.04027, Freq 0.00000, L1 2.25141, Spectral 0.38906, Gradient 0.68848) | LR 1.00e-05
+2026-07-28 15:50:27,185 INFO Epoch 2 | Batch 200/1186 | Loss 2.93752 (Pin 0.96649 [q90 0.46767, q10 0.49882], MS 1.97103, Freq 0.00000, L1 2.16894, Spectral 0.37478, Gradient 0.66748) | LR 1.00e-05
+2026-07-28 15:50:48,941 INFO Epoch 2 | Batch 250/1186 | Loss 3.12865 (Pin 1.02449 [q90 0.49716, q10 0.52733], MS 2.10416, Freq 0.00000, L1 2.29718, Spectral 0.38577, Gradient 0.69687) | LR 1.00e-05
+2026-07-28 15:51:10,716 INFO Epoch 2 | Batch 300/1186 | Loss 3.06177 (Pin 0.99409 [q90 0.48212, q10 0.51196], MS 2.06769, Freq 0.00000, L1 2.21934, Spectral 0.39045, Gradient 0.68965) | LR 1.00e-05
+2026-07-28 15:51:32,475 INFO Epoch 2 | Batch 350/1186 | Loss 2.92711 (Pin 0.96875 [q90 0.47243, q10 0.49633], MS 1.95835, Freq 0.00000, L1 2.18449, Spectral 0.38110, Gradient 0.68338) | LR 1.00e-05
+2026-07-28 15:51:54,237 INFO Epoch 2 | Batch 400/1186 | Loss 2.95746 (Pin 1.00612 [q90 0.48624, q10 0.51988], MS 1.95134, Freq 0.00000, L1 2.22524, Spectral 0.37005, Gradient 0.67157) | LR 1.00e-05
+2026-07-28 15:52:16,008 INFO Epoch 2 | Batch 450/1186 | Loss 2.95186 (Pin 0.99247 [q90 0.47951, q10 0.51296], MS 1.95940, Freq 0.00000, L1 2.18397, Spectral 0.36217, Gradient 0.66925) | LR 1.00e-05
+2026-07-28 15:52:37,776 INFO Epoch 2 | Batch 500/1186 | Loss 3.04748 (Pin 1.02126 [q90 0.48784, q10 0.53342], MS 2.02622, Freq 0.00000, L1 2.28834, Spectral 0.38549, Gradient 0.70398) | LR 1.00e-05
+2026-07-28 15:52:59,548 INFO Epoch 2 | Batch 550/1186 | Loss 3.04342 (Pin 1.02002 [q90 0.50033, q10 0.51968], MS 2.02340, Freq 0.00000, L1 2.26322, Spectral 0.38417, Gradient 0.69606) | LR 1.00e-05
+2026-07-28 15:53:21,308 INFO Epoch 2 | Batch 600/1186 | Loss 3.05097 (Pin 1.00453 [q90 0.48713, q10 0.51740], MS 2.04644, Freq 0.00000, L1 2.24194, Spectral 0.38764, Gradient 0.70910) | LR 1.00e-05
+2026-07-28 15:53:43,075 INFO Epoch 2 | Batch 650/1186 | Loss 2.90282 (Pin 0.99777 [q90 0.47896, q10 0.51881], MS 1.90505, Freq 0.00000, L1 2.19956, Spectral 0.36907, Gradient 0.66416) | LR 1.00e-05
+2026-07-28 15:54:04,840 INFO Epoch 2 | Batch 700/1186 | Loss 3.04983 (Pin 0.99866 [q90 0.48355, q10 0.51512], MS 2.05117, Freq 0.00000, L1 2.24758, Spectral 0.38443, Gradient 0.69388) | LR 1.00e-05
+2026-07-28 15:54:26,599 INFO Epoch 2 | Batch 750/1186 | Loss 2.99832 (Pin 0.99897 [q90 0.47759, q10 0.52138], MS 1.99935, Freq 0.00000, L1 2.23022, Spectral 0.37498, Gradient 0.67976) | LR 1.00e-05
+2026-07-28 15:54:48,365 INFO Epoch 2 | Batch 800/1186 | Loss 3.04398 (Pin 0.98339 [q90 0.47540, q10 0.50799], MS 2.06059, Freq 0.00000, L1 2.19902, Spectral 0.37023, Gradient 0.67088) | LR 1.00e-05
+2026-07-28 15:55:10,144 INFO Epoch 2 | Batch 850/1186 | Loss 2.90567 (Pin 0.96856 [q90 0.47312, q10 0.49544], MS 1.93710, Freq 0.00000, L1 2.18564, Spectral 0.38760, Gradient 0.69284) | LR 1.00e-05
+2026-07-28 15:55:31,914 INFO Epoch 2 | Batch 900/1186 | Loss 2.98424 (Pin 0.96831 [q90 0.47306, q10 0.49525], MS 2.01593, Freq 0.00000, L1 2.17959, Spectral 0.37573, Gradient 0.68636) | LR 1.00e-05
+2026-07-28 15:55:53,676 INFO Epoch 2 | Batch 950/1186 | Loss 2.94632 (Pin 0.97364 [q90 0.47088, q10 0.50276], MS 1.97268, Freq 0.00000, L1 2.17632, Spectral 0.39102, Gradient 0.69614) | LR 1.00e-05
+2026-07-28 15:56:15,447 INFO Epoch 2 | Batch 1000/1186 | Loss 2.84556 (Pin 0.98031 [q90 0.47331, q10 0.50700], MS 1.86525, Freq 0.00000, L1 2.19909, Spectral 0.37254, Gradient 0.68049) | LR 1.00e-05
+2026-07-28 15:56:37,220 INFO Epoch 2 | Batch 1050/1186 | Loss 3.02060 (Pin 0.98739 [q90 0.47670, q10 0.51069], MS 2.03321, Freq 0.00000, L1 2.21372, Spectral 0.37696, Gradient 0.68386) | LR 1.00e-05
+2026-07-28 15:56:58,993 INFO Epoch 2 | Batch 1100/1186 | Loss 2.99875 (Pin 1.01292 [q90 0.49211, q10 0.52080], MS 1.98583, Freq 0.00000, L1 2.26221, Spectral 0.38375, Gradient 0.70246) | LR 1.00e-05
+2026-07-28 15:57:20,753 INFO Epoch 2 | Batch 1150/1186 | Loss 2.87686 (Pin 0.99320 [q90 0.48096, q10 0.51224], MS 1.88366, Freq 0.00000, L1 2.21970, Spectral 0.37150, Gradient 0.67005) | LR 1.00e-05
+2026-07-28 15:58:12,414 INFO Epoch 2 | Val Loss 3.61793 (Pin 0.92574 [q90 0.44720, q10 0.47854], MS 2.69219, Freq 0.00000, L1 2.08149, Spectral 0.35457, Gradient 0.62264)
+2026-07-28 15:58:12,414 INFO Epoch 2 | Coverage q10/q50/q90 = 0.075/0.479/0.902 (nominal .10/.50/.90) | extreme tail = 0.111/0.463/0.860
+2026-07-28 15:58:12,738 INFO New best val loss: 3.61793 (saved checkpoints/best.pth)
+2026-07-28 15:58:34,535 INFO Epoch 3 | Batch 50/1186 | Loss 2.85696 (Pin 0.96149 [q90 0.46825, q10 0.49325], MS 1.89547, Freq 0.00000, L1 2.18279, Spectral 0.37108, Gradient 0.67404) | LR 1.00e-05
+2026-07-28 15:58:56,279 INFO Epoch 3 | Batch 100/1186 | Loss 3.13074 (Pin 0.99947 [q90 0.48154, q10 0.51793], MS 2.13126, Freq 0.00000, L1 2.24657, Spectral 0.38697, Gradient 0.70103) | LR 1.00e-05
+2026-07-28 15:59:18,032 INFO Epoch 3 | Batch 150/1186 | Loss 2.94906 (Pin 0.97634 [q90 0.47177, q10 0.50457], MS 1.97272, Freq 0.00000, L1 2.20921, Spectral 0.38397, Gradient 0.69184) | LR 1.00e-05
+2026-07-28 15:59:39,785 INFO Epoch 3 | Batch 200/1186 | Loss 3.09701 (Pin 0.97264 [q90 0.47319, q10 0.49946], MS 2.12437, Freq 0.00000, L1 2.21120, Spectral 0.39104, Gradient 0.71155) | LR 1.00e-05
+2026-07-28 16:00:01,530 INFO Epoch 3 | Batch 250/1186 | Loss 3.01886 (Pin 0.95915 [q90 0.46302, q10 0.49613], MS 2.05971, Freq 0.00000, L1 2.17305, Spectral 0.39796, Gradient 0.70978) | LR 1.00e-05
+2026-07-28 16:00:23,276 INFO Epoch 3 | Batch 300/1186 | Loss 2.87841 (Pin 0.97643 [q90 0.47559, q10 0.50084], MS 1.90198, Freq 0.00000, L1 2.19182, Spectral 0.37815, Gradient 0.68799) | LR 1.00e-05
+2026-07-28 16:00:45,026 INFO Epoch 3 | Batch 350/1186 | Loss 3.06201 (Pin 0.97892 [q90 0.47943, q10 0.49948], MS 2.08309, Freq 0.00000, L1 2.23687, Spectral 0.39889, Gradient 0.72829) | LR 1.00e-05
+2026-07-28 16:01:06,783 INFO Epoch 3 | Batch 400/1186 | Loss 2.82284 (Pin 0.98412 [q90 0.47359, q10 0.51052], MS 1.83872, Freq 0.00000, L1 2.19826, Spectral 0.37473, Gradient 0.67950) | LR 1.00e-05
+2026-07-28 16:01:28,534 INFO Epoch 3 | Batch 450/1186 | Loss 2.87788 (Pin 0.98262 [q90 0.48377, q10 0.49885], MS 1.89526, Freq 0.00000, L1 2.20763, Spectral 0.39121, Gradient 0.70858) | LR 1.00e-05
+2026-07-28 16:01:50,300 INFO Epoch 3 | Batch 500/1186 | Loss 2.98311 (Pin 1.00407 [q90 0.49122, q10 0.51286], MS 1.97904, Freq 0.00000, L1 2.24785, Spectral 0.39153, Gradient 0.70804) | LR 1.00e-05
+2026-07-28 16:02:12,054 INFO Epoch 3 | Batch 550/1186 | Loss 2.83721 (Pin 0.97640 [q90 0.47258, q10 0.50382], MS 1.86081, Freq 0.00000, L1 2.21361, Spectral 0.39294, Gradient 0.70497) | LR 1.00e-05
+2026-07-28 16:02:33,816 INFO Epoch 3 | Batch 600/1186 | Loss 2.76455 (Pin 0.95002 [q90 0.46634, q10 0.48368], MS 1.81453, Freq 0.00000, L1 2.14874, Spectral 0.37263, Gradient 0.68411) | LR 1.00e-05
