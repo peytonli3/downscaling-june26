@@ -6,6 +6,98 @@ hyperparameters, training details) are not listed here.
 
 ---
 
+## 0729  *(scripts/new_enscgp_swin.py + scripts/train_new_enscgp_swin.py + scripts/multiscale_loss.py)*
+
+**Logs / checkpoints:** `runs/0729/`
+
+A simplification pass over the whole pipeline (audited for complexity that wasn't earning
+its keep). Model-side changes are breaking; trainer/loss changes are not.
+
+### Breaking changes from 0714
+
+- **`mean_gate` / `offset_gate` removed.** Both were learnable scalars gating a head's
+  residual onto its base (see 0629). `mean_gate` had settled at 0.125 after a full 100-epoch
+  run -- barely above its 0.1 init -- indicating the vanishing-upstream-gradient problem it
+  was designed to avoid wasn't costing much here in practice. Replaced with two per-head init
+  schemes instead of a shared gating mechanism:
+  - `mean_head`'s final conv reverts to **near-zero weight init** (std=1e-3, the pre-0629
+    approach) -- a fresh model's q50 output is ~0, so q50 starts at exactly `mean_base`.
+  - `offset_head`'s final conv keeps **Kaiming-normal** (full strength) but its **bias** is
+    now initialized to `inverse_softplus(offset_spread_init)` (default 3.0 m/s -- the
+    measured RMS of WRF-minus-bicubic over a 500-sample draw, not a physically exact
+    uncertainty) instead of zero, so a fresh model's up/down offsets start near that target
+    on every pixel.
+- **EnsCGP-sigma offset seeding removed.** The offset head no longer reads the EnsCGP
+  posterior's own Cholesky as a per-pixel seed (`sigma_u=L11, sigma_v=sqrt(L21^2+L22^2)`,
+  gated in inverse-softplus space around it). `_inverse_softplus` (the per-tensor version)
+  and `_enscgp_marginal_std` are removed; `_quantile_offset` is now just
+  `softplus(raw) + OFFSET_EPS`, no external base. `init_spread_scale` config key replaced by
+  `offset_spread_init`.
+- **Input decomposition removed.** `model_input` is now `cat([bicubic, posterior])` (the
+  whole 5-channel EnsCGP posterior, concatenated directly) instead of
+  `cat([bicubic, enscgp_mean - bicubic, L11, L21, L22])`. Since `conv_first` is linear, the
+  two forms are related by an invertible linear recombination and represent *exactly* the
+  same set of functions -- the residual decomposition changed no expressivity, only added
+  complexity. `INPUT_CHANNELS` stays 7 (same shape); only the *meaning* of channels 2-3
+  changes (raw EnsCGP u/v, not an EnsCGP-minus-bicubic residual).
+- **Net effect on `--resume-weights-only` from a 0714 checkpoint:** `mean_head`, `offset_head`,
+  backbone, and `terrain_encoder` all transfer by name+shape (their module shapes are
+  unchanged; a resume doesn't care about the *init* scheme, since the weights are already
+  trained). `mean_gate`/`offset_gate` are dropped (no longer exist). **Caveat:** `conv_first`
+  *also* transfers by shape (still 11 input channels) despite its channels 2-3 now meaning
+  something different -- a naive partial load silently gives `conv_first` weights calibrated
+  to the wrong input at those channels. Prefer training 0729 fresh from EnsCGP; only resume
+  through this boundary if you explicitly want to test it.
+- **Parameter count:** 2,087,058 (2,087,060 from 0714 minus the two removed gate scalars).
+
+### Non-breaking (trainer / loss)
+
+- **Early stopping actually implemented.** `early_stop_patience` existed as a config key
+  since before 0714 but was never read by the trainer -- the 0714 run hit its best val loss
+  at epoch 29 and trained to epoch 99 anyway (~70 wasted epochs). Now tracked as consecutive
+  *val checks* without improvement (not raw epochs, so it composes correctly with
+  `val_interval != 1`); training breaks out of the loop once patience is exceeded.
+- **Zero-weight structural terms (l1/spectral/gradient in the active config) are skipped
+  during training**, not just multiplied by 0 -- `compute_weighted_loss` takes a
+  `compute_all` flag; during training a term is only computed if its own weight is > 0
+  (saves real compute: `spectral()` alone is two `rfft2` calls per batch for a term that
+  wasn't influencing anything). At validation, `compute_all=True` and every structural term
+  is computed and logged regardless of weight, as a diagnostic -- so `ms`/`freq` also stay
+  visible at their real value even if their weight were ever set to 0.
+  `MultiscaleLoss`/`FreqBandLoss` are now built unconditionally at startup (a one-time,
+  usually cache-hit `sigma_band` load) rather than only when their weight is > 0, so they're
+  always available for that val-side reporting; only the per-batch *call* is gated.
+- **`metric_scale`** (the sliced-Wasserstein-vs-L1 scale calibration in `MultiscaleLoss`) is
+  now a fixed module constant (`METRIC_SCALE = {"l1": 1.0, "sw": 2.75}`) instead of a
+  per-run config knob -- 2.75 was a measured constant, not something meant to vary run to
+  run; removed from `new_enscgp_swin_config.json`'s `multiscale` section.
+- **`multiscale_loss.py`'s tuning guardrail docstring fixed** -- it still referenced NLL and
+  the (removed at 0714) z-score calibration script; updated to reference coverage/PIT
+  (`eval_quantile_calibration.py`) instead.
+
+### Removed (dead code, unrelated to the model change)
+
+- `scripts/precompute_prior_spread.py`, `scripts/train_finetune_variance.py`, and
+  `extra_scripts/graphing/verify_variance_conditioning.py` -- all downstream of
+  `variance_conditioning`, a model constructor option removed entirely at 0714. Code
+  recoverable via tag `archive/variance-conditioning`.
+- `data/enscgp_prior_spread.npy` (2.1 GB) and `data/cond_feature_stats.npz`, the data
+  products of the script above -- moved to `_archive/` on disk (not deleted).
+
+### Investigated, left unchanged
+
+- **Terrain encoder**: benchmarked at 0.57% of a training step's forward+backward time
+  (2.4ms of 421.6ms) despite holding 6.7% of total parameters -- not a meaningful cost.
+  Left as-is; the native-1000x1000-resolution processing before downsampling is believed to
+  matter for fine coastline/slope detail.
+- **`FreqBandLoss`** (spatial-vs-FFT decomposition mismatch with `MultiscaleLoss`'s
+  `sigma_band`, flagged as a possible unification target) -- kept as a separate term; an
+  informal test found measurably worse results with `freq_weight=0`. A more rigorous
+  `runs/0714_freq0/` ablation (100 epochs, everything else identical to the 0714 run) is
+  on disk for a fuller before/after comparison.
+
+---
+
 ## 0714  *(scripts/new_enscgp_swin.py + scripts/train_new_enscgp_swin.py)*
 
 **Logs / checkpoints:** `runs/0714/`

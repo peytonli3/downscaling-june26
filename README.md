@@ -36,12 +36,15 @@ git tag v6-<date>
 Revisit an old version with `git checkout <tag>` — it restores the exact
 model/train/config. No more snapshot directories inside `scripts/`.
 
-- Current tip is tagged `v5-0701special`.
+- Current tip is tagged `v7-0729`.
 - `archive/pre-reorg-snapshots` holds the original tree, including the `0626_v1`
   and `0628_v2` snapshot dirs. Retrieve old code without checking out, e.g.:
   `git show archive/pre-reorg-snapshots:scripts/0626_v1/new_enscgp_swin.py`
 - `archive/resnet-refiner` — the retired ResNet-refiner line (code); its binaries
   live in `_archive/`.
+- `archive/variance-conditioning` — the retired `variance_conditioning` model path
+  (removed at 0714) and its supporting scripts (removed at 0729); the data
+  products it consumed live in `_archive/`.
 - **v2 (0627) and v4 (0629) code is not recoverable** — it was overwritten in the
   mutable top-level `scripts/` before git existed. `CHANGELOG.md` describes the
   diffs, but there is no source snapshot. (This is exactly the gap git now closes.)

@@ -18,7 +18,7 @@ Pipeline
    ported from extra_scripts/band_error_diagnostics.py's numpy/scipy version.
 
 2. Per band, per component (u, v) -- summed over both:
-     band_loss = metric_scale[metric] * D_band(pred_band, truth_band) / (sigma_band[band, component] + eps)
+     band_loss = METRIC_SCALE[metric] * D_band(pred_band, truth_band) / (sigma_band[band, component] + eps)
    D_band is configurable per band via metric_per_band (default
    ["l1","sw","sw","sw","sw"], coarse -> fine): "l1" on the coarsest band (it's already
    ~correct per the diagnostic, no need for OT there), sliced Wasserstein on the active
@@ -29,19 +29,21 @@ Pipeline
    amplifying grid noise into a huge loss weight. sigma_band calibrates ACROSS BANDS (so
    each band's natural energy scale doesn't bias how much it matters).
 
-   metric_scale (default {"l1": 1.0, "sw": 1.0}, i.e. off) calibrates ACROSS METRIC TYPES
-   instead: sliced-Wasserstein and L1 are computed differently and read at different
-   absolute scales even on identical data (empirically L1 ~2-4x larger than sliced-W on
-   this dataset's bands -- displacement-dominated errors genuinely cost less under sliced-W
-   than under L1, which is the whole point, but that means an "sw" band's raw contribution
-   is *systematically* smaller than an "l1" band's purely from the choice of metric, not
-   from that band actually mattering less). metric_scale corrects that systematic bias
-   (one global multiplier per metric, not per band -- sigma_band already handles per-band
-   calibration) WITHOUT erasing the displacement-tolerance effect itself: scale "sw" up by
-   the average l1-vs-sw ratio measured on real data (e.g. via a one-off diagnostic comparing
-   both metrics on the same pred/truth bands), and a genuinely-displaced (not actually
-   wrong-amplitude) band will still read smaller under calibrated-sw than it would under l1
-   -- it's just no longer smaller for the wrong (purely-units) reason on top of that.
+   METRIC_SCALE ({"l1": 1.0, "sw": 2.75}, a fixed module constant, not a config knob)
+   calibrates ACROSS METRIC TYPES instead: sliced-Wasserstein and L1 are computed
+   differently and read at different absolute scales even on identical data (empirically
+   L1 ~2-4x larger than sliced-W on this dataset's bands -- displacement-dominated errors
+   genuinely cost less under sliced-W than under L1, which is the whole point, but that
+   means an "sw" band's raw contribution is *systematically* smaller than an "l1" band's
+   purely from the choice of metric, not from that band actually mattering less).
+   METRIC_SCALE corrects that systematic bias (one global multiplier per metric, not per
+   band -- sigma_band already handles per-band calibration) WITHOUT erasing the
+   displacement-tolerance effect itself: 2.75 was measured as the average l1-vs-sw ratio on
+   real data (via a one-off diagnostic comparing both metrics on the same pred/truth
+   bands), and a genuinely-displaced (not actually wrong-amplitude) band still reads
+   smaller under calibrated-sw than under l1 -- it's just no longer smaller for the wrong
+   (purely-units) reason on top of that. Re-measure and update this constant if the data
+   distribution shifts enough to change the ratio.
 
 3. Sliced Wasserstein, spatial-but-displacement-tolerant (sliced_wasserstein_patches): the
    standard image "Sliced Wasserstein Distance" recipe (Karras et al., used as a GAN
@@ -61,13 +63,14 @@ Pipeline
    (no patches, no position), unlike (3). Useful as an auxiliary heavy-tail term; kept
    separate from the main per-band metric.
 
-Tuning guardrail (read before raising w_ms in train_new_enscgp_swin_config.json):
-NLL stays at ~its current weight; raise ms_weight GRADUALLY from 0. After each bump, check:
-  - the z-score distribution (eval_zscore_calibration.py) stays approx N(0,1) -- if it
-    fattens/narrows, ms_weight is starving the variance head (chol_head/NLL), back off.
+Tuning guardrail (read before raising ms_weight in new_enscgp_swin_config.json; post-0714,
+uncertainty is trained by pinball on q10/q90, not NLL -- this only concerns q50):
+raise ms_weight GRADUALLY from 0. After each bump, check:
   - the eigenspectrum (compare_eigenspectra_enscgp_swin.py) should rise toward WRF, not
     away from it.
-  - z-score-map patches should shrink, not grow.
+  - coverage / the PIT histogram (eval_quantile_calibration.py) shouldn't move much --
+    ms_weight only supervises q50, so a shift there suggests q50 and the offset head are
+    fighting (e.g. via the shared backbone), not that ms_weight itself is miscalibrated.
 
 Self-test (no GPU/checkpoint/training data required for the synthetic parts):
     python multiscale_loss.py
@@ -204,7 +207,12 @@ def load_or_compute_sigma_band(data_dir: Path, wrf_path: Path, train_idx: np.nda
 # --------------------------------------------------------------------------------------
 # MultiscaleLoss
 # --------------------------------------------------------------------------------------
-DEFAULT_METRIC_SCALE = {"l1": 1.0, "sw": 1.0}  # off (no-op) by default -- see module docstring
+# Global per-metric-type multiplier (NOT per-band -- sigma_band already handles per-band
+# calibration; this corrects the systematic scale gap BETWEEN metric types instead). A
+# fixed module constant, not a config knob: 2.75 was measured as the average l1-vs-sw
+# ratio on real data -- see module docstring point 2. Re-measure and update in code if the
+# data distribution shifts enough to change the ratio.
+METRIC_SCALE = {"l1": 1.0, "sw": 2.75}
 
 
 class MultiscaleLoss:
@@ -216,8 +224,7 @@ class MultiscaleLoss:
                  metric_per_band: tuple[str, ...] = DEFAULT_METRIC_PER_BAND,
                  patch_size: int = 8, patch_stride: int = 4, n_projections: int = 64,
                  sigma_floor: float = 1e-3, eps: float = 1e-8,
-                 histogram_weight: float = 0.0,
-                 metric_scale: dict[str, float] | None = None):
+                 histogram_weight: float = 0.0):
         if len(metric_per_band) != n_levels:
             raise ValueError(f"metric_per_band must have length n_levels={n_levels}, got {len(metric_per_band)}")
         for m in metric_per_band:
@@ -234,19 +241,13 @@ class MultiscaleLoss:
         self.eps = eps
         self.sigma_band = sigma_band.clamp_min(sigma_floor)  # (n_levels, 2), floored once
         self.histogram_weight = histogram_weight
-        # Global per-metric-type multiplier (NOT per-band -- sigma_band already handles
-        # per-band calibration; this corrects the systematic scale gap BETWEEN metric types
-        # instead). Defaults to a no-op so introducing this knob doesn't change existing runs.
-        self.metric_scale = dict(DEFAULT_METRIC_SCALE)
-        if metric_scale is not None:
-            self.metric_scale.update(metric_scale)
 
     def _band_metric(self, metric: str, p: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         if metric == "l1":
             d = F.l1_loss(p, t)
         else:
             d = sliced_wasserstein_patches(p, t, self.patch_size, self.patch_stride, self.n_projections)
-        return self.metric_scale[metric] * d
+        return METRIC_SCALE[metric] * d
 
     def __call__(self, pred_mean: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
         pred_bands = laplacian_bands(pred_mean, self.n_levels, self.base_sigma)    # finest -> coarsest

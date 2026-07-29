@@ -5,9 +5,9 @@ Per sample:
 - input:  data/enscgp_posterior.npy        (N, 5, 200, 200) = [u, v, L11, L21, L22],
           the EnsCGP first guess (enscgp_train.py), and
           data/era5_uv_2ch_bicubic.npy      (N, 2, 200, 200) = [u, v], the bicubic-
-          upsampled ERA5 baseline. The model is fed the bicubic field, the
-          EnsCGP-mean-minus-bicubic residual, and the EnsCGP Cholesky channels, and
-          predicts a residual on top of the bicubic baseline (see new_enscgp_swin.py).
+          upsampled ERA5 baseline. The model is fed bicubic + the whole EnsCGP
+          posterior directly, and predicts a residual on top of a configurable base
+          (see new_enscgp_swin.py's residual_base).
 - target: data/wrf_uv.npy                   (N, 2, 200, 200) = [u, v], WRF ground truth.
 - terrain: land_sea_mask_features.npy + topography_features.npy, static across
           all samples, encoded by TerrainEncoder (terrain_encoder.py) -- a
@@ -27,6 +27,14 @@ The uncertainty is trained SOLELY by the pinball (quantile) loss on q90/q10 -- t
 Gaussian NLL and its Cholesky are gone. q50 is deliberately NOT pinball-trained (a
 pinball(0.5) term would pull it toward the blurry pointwise median and fight the
 structural losses). All weights are configurable ("training" section).
+
+Zero-weight structural terms (l1/spectral/gradient in the active config) are SKIPPED
+during training -- not computed at all, not just multiplied by 0 -- so no wasted compute
+(two rfft2 calls for spectral() alone) or log noise for a term that isn't influencing the
+gradient. At VALIDATION time every structural term is still computed and logged (weight or
+not), purely as a diagnostic -- so you can see e.g. what l1/spectral currently read even
+while they're off, without paying that cost every training batch. See compute_all in
+compute_weighted_loss / evaluate.
 
 Extreme weighting: rare high-wind pixels are a tiny fraction of the field, so an
 unweighted pinball under-trains them and q90 gets smoothed down off the damaging peaks.
@@ -78,7 +86,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from new_enscgp_swin import DEFAULT_CONFIG_PATH, ProbabilisticSwin2SR, build_model, load_config
 from terrain_encoder import load_terrain_input
-from multiscale_loss import DEFAULT_METRIC_PER_BAND, FreqBandLoss, MultiscaleLoss, load_or_compute_sigma_band
+from multiscale_loss import DEFAULT_METRIC_PER_BAND, METRIC_SCALE, FreqBandLoss, MultiscaleLoss, load_or_compute_sigma_band
 
 
 class EnsCGPSwinDataset(Dataset):
@@ -193,7 +201,8 @@ def pinball_loss(q: torch.Tensor, target: torch.Tensor, tau: float,
 def compute_weighted_loss(pred: torch.Tensor, target: torch.Tensor, weights: dict, mean_aux: MeanAuxLosses,
                            ms_loss_fn: MultiscaleLoss | None = None,
                            freq_loss_fn: FreqBandLoss | None = None,
-                           extreme_cfg: dict | None = None) -> dict:
+                           extreme_cfg: dict | None = None,
+                           compute_all: bool = False) -> dict:
     """pred: (B,6,H,W) [q10_u,q10_v, q50_u,q50_v, q90_u,q90_v]; target: (B,2,H,W) [u,v].
     weights: {"ms","freq","l1","spectral","gradient","pin"} -> float.
 
@@ -202,20 +211,27 @@ def compute_weighted_loss(pred: torch.Tensor, target: torch.Tensor, weights: dic
     only by pinball(q90, .9) + pinball(q10, .1). ms_loss_fn/freq_loss_fn are None when their
     weight is 0 (no precompute, no per-batch cost) -- see train()'s startup.
 
+    compute_all: when False (training), a structural term whose weight is 0 is SKIPPED
+    entirely (its dict entry is None, not a zero tensor) -- since weight=0 makes it a no-op
+    for `total` regardless, skipping it changes no gradient, only saves compute. When True
+    (validation), every structural term is computed and returned regardless of weight, as a
+    diagnostic -- see evaluate().
+
     extreme_cfg (or None = off): {"enabled": bool, "alpha": float, "apply_to_q10": bool}.
     When enabled, up-weights high-wind pixels in the q90 pinball (and q10 if apply_to_q10).
 
-    Returns a dict with every component (all detached except "total", which carries the graph).
+    Returns a dict with every component (all detached except "total", which carries the
+    graph); a skipped structural term's value is None.
     """
     q10 = pred[:, ProbabilisticSwin2SR.Q10_SLICE]
     q50 = pred[:, ProbabilisticSwin2SR.Q50_SLICE]
     q90 = pred[:, ProbabilisticSwin2SR.Q90_SLICE]
 
-    ms = ms_loss_fn(q50, target) if ms_loss_fn is not None else pred.new_zeros(())
-    freq = freq_loss_fn(q50, target) if freq_loss_fn is not None else pred.new_zeros(())
-    l1 = F.l1_loss(q50, target)
-    spectral = mean_aux.spectral(q50, target)
-    gradient = mean_aux.gradient(q50, target)
+    ms = ms_loss_fn(q50, target) if (ms_loss_fn is not None and (compute_all or weights["ms"] > 0)) else None
+    freq = freq_loss_fn(q50, target) if (freq_loss_fn is not None and (compute_all or weights["freq"] > 0)) else None
+    l1 = F.l1_loss(q50, target) if (compute_all or weights["l1"] > 0) else None
+    spectral = mean_aux.spectral(q50, target) if (compute_all or weights["spectral"] > 0) else None
+    gradient = mean_aux.gradient(q50, target) if (compute_all or weights["gradient"] > 0) else None
 
     w90 = w10 = None
     if extreme_cfg is not None and extreme_cfg.get("enabled", False):
@@ -226,18 +242,18 @@ def compute_weighted_loss(pred: torch.Tensor, target: torch.Tensor, weights: dic
     pin10 = pinball_loss(q10, target, 0.1, w10)
     pin = pin90 + pin10
 
-    total = (
-        weights["ms"] * ms
-        + weights["freq"] * freq
-        + weights["l1"] * l1
-        + weights["spectral"] * spectral
-        + weights["gradient"] * gradient
-        + weights["pin"] * pin
-    )
+    total = weights["pin"] * pin
+    for key, term in (("ms", ms), ("freq", freq), ("l1", l1), ("spectral", spectral), ("gradient", gradient)):
+        if term is not None:
+            total = total + weights[key] * term
+
     return {
         "total": total,
-        "ms": ms.detach(), "freq": freq.detach(), "l1": l1.detach(),
-        "spectral": spectral.detach(), "gradient": gradient.detach(),
+        "ms": ms.detach() if ms is not None else None,
+        "freq": freq.detach() if freq is not None else None,
+        "l1": l1.detach() if l1 is not None else None,
+        "spectral": spectral.detach() if spectral is not None else None,
+        "gradient": gradient.detach() if gradient is not None else None,
         "pin": pin.detach(), "pin90": pin90.detach(), "pin10": pin10.detach(),
     }
 
@@ -267,7 +283,12 @@ def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, best_va
     }, path)
 
 
-LOSS_COMPONENT_KEYS = ("total", "ms", "freq", "l1", "spectral", "gradient", "pin", "pin90", "pin10")
+# ALWAYS_KEYS are computed every call, train or val. STRUCTURAL_KEYS are only computed when
+# compute_all=True (val) or their own weight is > 0 (train) -- see compute_weighted_loss.
+ALWAYS_KEYS = ("total", "pin", "pin90", "pin10")
+STRUCTURAL_KEYS = ("ms", "freq", "l1", "spectral", "gradient")
+STRUCTURAL_LABELS = {"ms": "MS", "freq": "Freq", "l1": "L1", "spectral": "Spectral", "gradient": "Gradient"}
+LOSS_COMPONENT_KEYS = ALWAYS_KEYS + STRUCTURAL_KEYS  # evaluate() always computes all of these
 # Coverage = fraction of truth pixels at or below each predicted quantile (target nominal
 # in parentheses). "_ext" variants restrict to the extreme tail (|wind| above its per-sample
 # 90th percentile) -- the damage-relevant region where q90 must actually reach the peaks.
@@ -303,7 +324,9 @@ def evaluate(model, loader, terrain_raw, device, weights: dict, mean_aux: MeanAu
              freq_loss_fn: FreqBandLoss | None = None,
              extreme_cfg: dict | None = None) -> dict:
     """Returns per-sample-averaged loss components plus empirical coverage (see
-    compute_weighted_loss / coverage_metrics)."""
+    compute_weighted_loss / coverage_metrics). Every structural term is computed
+    (compute_all=True) regardless of its weight -- this is the one place they're always
+    visible, even while off during training; see compute_weighted_loss."""
     model.eval()
     totals = {k: 0.0 for k in LOSS_COMPONENT_KEYS}
     cov_below = {k: 0 for k in COVERAGE_KEYS}
@@ -314,7 +337,8 @@ def evaluate(model, loader, terrain_raw, device, weights: dict, mean_aux: MeanAu
         bicubic = bicubic.to(device, non_blocking=True)
         wrf = wrf.to(device, non_blocking=True)
         pred = model(posterior, bicubic, terrain_raw)
-        loss_dict = compute_weighted_loss(pred, wrf, weights, mean_aux, ms_loss_fn, freq_loss_fn, extreme_cfg)
+        loss_dict = compute_weighted_loss(pred, wrf, weights, mean_aux, ms_loss_fn, freq_loss_fn,
+                                          extreme_cfg, compute_all=True)
         b = posterior.shape[0]
         for k in LOSS_COMPONENT_KEYS:
             totals[k] += loss_dict[k].item() * b
@@ -389,11 +413,19 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
     if resume_path is not None:
         ckpt = torch.load(resume_path, map_location=device)
         if resume_weights_only:
-            # PARTIAL, non-strict load: transfer only tensors whose name AND shape match
-            # (backbone, conv_first, terrain_encoder, mean_head/mean_gate). This is how a
-            # Gaussian/Cholesky checkpoint seeds the quantile model -- q50 inherits the old
-            # mean head; the new offset_head/offset_gate start fresh, and the dropped
-            # chol_head/chol_gate are simply not loaded.
+            # PARTIAL, non-strict load: transfer only tensors whose name AND shape match.
+            # Resuming a 0714 (v6) checkpoint into this (v7) architecture: mean_head,
+            # offset_head, backbone, and terrain_encoder all keep the same module shapes, so
+            # they transfer even though mean_head/offset_head's INIT scheme changed (irrelevant
+            # for a resume -- their weights are already trained, not at init values). The
+            # dropped mean_gate/offset_gate scalars (v7 has no gates) are simply not loaded.
+            # CAVEAT: conv_first's weight shape is ALSO unchanged (still 11 input channels),
+            # so it transfers too -- but its channels 2-3 now carry raw EnsCGP u/v instead of
+            # an EnsCGP-minus-bicubic residual (see new_enscgp_swin.py's module docstring).
+            # That's a semantic change hiding behind an unchanged shape: a naive partial load
+            # gives conv_first weights calibrated to the WRONG input at those two channels.
+            # Prefer training v7 fresh from EnsCGP; only resume through this boundary if you
+            # explicitly want to test it.
             model_sd = model.state_dict()
             filtered = {k: v for k, v in ckpt["model_state_dict"].items()
                         if k in model_sd and v.shape == model_sd[k].shape}
@@ -425,62 +457,75 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
     logger.info("Loss weights: %s", weights)
     logger.info("Extreme weighting: %s", extreme_cfg)
 
-    # multiscale_loss: only precompute/build when ms_weight > 0, so it's a true no-op (no
-    # sigma_band precompute cost) when off -- see multiscale_loss.py's module docstring for
-    # the tuning guardrail (raise ms_weight gradually, watch the z-score calibration).
-    ms_loss_fn = None
-    if weights["ms"] > 0:
-        ms_cfg = t.get("multiscale", {})
-        ms_n_levels = ms_cfg.get("n_levels", 5)
-        ms_base_sigma = ms_cfg.get("base_sigma", 1.0)
-        sigma_band = load_or_compute_sigma_band(
-            data_dir, wrf_path, train_idx, ms_n_levels, ms_base_sigma, device=str(device),
-            max_samples=ms_cfg.get("sigma_max_samples", 2000),
-            force_recompute=ms_cfg.get("force_recompute_sigma_band", False),
-        )
-        ms_loss_fn = MultiscaleLoss(
-            sigma_band=sigma_band, n_levels=ms_n_levels, base_sigma=ms_base_sigma,
-            metric_per_band=tuple(ms_cfg.get("metric_per_band", DEFAULT_METRIC_PER_BAND)),
-            patch_size=ms_cfg.get("patch_size", 8), patch_stride=ms_cfg.get("patch_stride", 4),
-            n_projections=ms_cfg.get("n_projections", 64),
-            sigma_floor=ms_cfg.get("sigma_floor", 1e-3),
-            histogram_weight=ms_cfg.get("histogram_weight", 0.0),
-            metric_scale=ms_cfg.get("metric_scale"),
-        )
-        logger.info(
-            "multiscale_loss enabled: n_levels=%d, base_sigma=%.2f, metric_per_band=%s, metric_scale=%s, sigma_band=%s",
-            ms_n_levels, ms_base_sigma, ms_loss_fn.metric_per_band, ms_loss_fn.metric_scale, sigma_band.tolist(),
-        )
+    # Structural terms with weight 0 are skipped entirely during TRAINING (see
+    # compute_weighted_loss's compute_all) -- only the active ones are tracked/logged per
+    # batch. evaluate() always computes and logs every structural term regardless.
+    active_structural_keys = [k for k in STRUCTURAL_KEYS if weights[k] > 0]
+    active_train_keys = list(ALWAYS_KEYS) + active_structural_keys
+    logger.info("Structural terms computed during training (weight > 0): %s", active_structural_keys)
 
-    freq_loss_fn = None
-    if weights["freq"] > 0:
-        fb_cfg = t.get("freq_band", {})
-        fb_n_levels = fb_cfg.get("n_levels", 5)
-        fb_base_sigma = fb_cfg.get("base_sigma", 2.0)
-        # Reuse the same sigma_band cache as MultiscaleLoss (same filter sigmas).
-        fb_sigma_band = load_or_compute_sigma_band(
-            data_dir, wrf_path, train_idx, fb_n_levels, fb_base_sigma, device=str(device),
-            max_samples=fb_cfg.get("sigma_max_samples", 2000),
-            force_recompute=fb_cfg.get("force_recompute_sigma_band", False),
-        )
-        freq_loss_fn = FreqBandLoss(
-            sigma_band=fb_sigma_band, n_levels=fb_n_levels, base_sigma=fb_base_sigma,
-            cdf_weight_mode=fb_cfg.get("cdf_weight_mode", "down_extremes"),
-            sigma_floor=fb_cfg.get("sigma_floor", 1e-3),
-        )
-        logger.info(
-            "freq_band_loss enabled: n_levels=%d, base_sigma=%.2f, cdf_weight_mode=%s, sigma_band=%s",
-            fb_n_levels, fb_base_sigma, freq_loss_fn.cdf_weight_mode, fb_sigma_band.tolist(),
-        )
+    # multiscale_loss / freq_band_loss: built UNCONDITIONALLY (not gated on weight > 0) so
+    # evaluate()'s compute_all can always report them on val, even at weight 0 -- see
+    # compute_weighted_loss. This costs one load_or_compute_sigma_band call each at startup
+    # (a cache hit after the first run; a few minutes to precompute on a fresh n_levels/
+    # base_sigma combo) -- a ONE-TIME cost, not per-batch, unlike computing the terms
+    # themselves. Per-batch, compute_weighted_loss still only CALLS a term when
+    # compute_all=True (val) or its own weight > 0 (train) -- see multiscale_loss.py's
+    # module docstring for the ms_weight tuning guardrail.
+    ms_cfg = t.get("multiscale", {})
+    ms_n_levels = ms_cfg.get("n_levels", 5)
+    ms_base_sigma = ms_cfg.get("base_sigma", 1.0)
+    sigma_band = load_or_compute_sigma_band(
+        data_dir, wrf_path, train_idx, ms_n_levels, ms_base_sigma, device=str(device),
+        max_samples=ms_cfg.get("sigma_max_samples", 2000),
+        force_recompute=ms_cfg.get("force_recompute_sigma_band", False),
+    )
+    ms_loss_fn = MultiscaleLoss(
+        sigma_band=sigma_band, n_levels=ms_n_levels, base_sigma=ms_base_sigma,
+        metric_per_band=tuple(ms_cfg.get("metric_per_band", DEFAULT_METRIC_PER_BAND)),
+        patch_size=ms_cfg.get("patch_size", 8), patch_stride=ms_cfg.get("patch_stride", 4),
+        n_projections=ms_cfg.get("n_projections", 64),
+        sigma_floor=ms_cfg.get("sigma_floor", 1e-3),
+        histogram_weight=ms_cfg.get("histogram_weight", 0.0),
+    )
+    logger.info(
+        "multiscale_loss built (active during training: %s): n_levels=%d, base_sigma=%.2f, "
+        "metric_per_band=%s, METRIC_SCALE=%s (fixed), sigma_band=%s",
+        weights["ms"] > 0, ms_n_levels, ms_base_sigma, ms_loss_fn.metric_per_band, METRIC_SCALE, sigma_band.tolist(),
+    )
+
+    fb_cfg = t.get("freq_band", {})
+    fb_n_levels = fb_cfg.get("n_levels", 5)
+    fb_base_sigma = fb_cfg.get("base_sigma", 2.0)
+    # Reuse the same sigma_band cache as MultiscaleLoss (same filter sigmas).
+    fb_sigma_band = load_or_compute_sigma_band(
+        data_dir, wrf_path, train_idx, fb_n_levels, fb_base_sigma, device=str(device),
+        max_samples=fb_cfg.get("sigma_max_samples", 2000),
+        force_recompute=fb_cfg.get("force_recompute_sigma_band", False),
+    )
+    freq_loss_fn = FreqBandLoss(
+        sigma_band=fb_sigma_band, n_levels=fb_n_levels, base_sigma=fb_base_sigma,
+        cdf_weight_mode=fb_cfg.get("cdf_weight_mode", "down_extremes"),
+        sigma_floor=fb_cfg.get("sigma_floor", 1e-3),
+    )
+    logger.info(
+        "freq_band_loss built (active during training: %s): n_levels=%d, base_sigma=%.2f, "
+        "cdf_weight_mode=%s, sigma_band=%s",
+        weights["freq"] > 0, fb_n_levels, fb_base_sigma, freq_loss_fn.cdf_weight_mode, fb_sigma_band.tolist(),
+    )
 
     grad_clip_norm = t.get("grad_clip_norm", 1.0)
     log_every = config["logging"].get("log_every", 50)
     val_interval = t.get("val_interval", 1)
+    early_stop_patience = t.get("early_stop_patience", 8)
+    logger.info("Early stop patience: %s val check(s) without improvement%s",
+                early_stop_patience, "" if early_stop_patience > 0 else " (disabled)")
 
     global_step = 0
+    epochs_since_improvement = 0
     model.train()
     for epoch in range(start_epoch, num_epochs):
-        running = {k: 0.0 for k in LOSS_COMPONENT_KEYS}
+        running = {k: 0.0 for k in active_train_keys}
         for i, (posterior, bicubic, wrf) in enumerate(train_loader):
             posterior = posterior.to(device, non_blocking=True)
             bicubic = bicubic.to(device, non_blocking=True)
@@ -497,29 +542,31 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
             optimizer.step()
             scheduler.step()
 
-            for k in LOSS_COMPONENT_KEYS:
+            for k in active_train_keys:
                 running[k] += loss_dict[k].item()
             global_step += 1
 
             if (i + 1) % log_every == 0:
+                struct_str = "".join(
+                    f", {STRUCTURAL_LABELS[k]} {running[k] / log_every:.5f}" for k in active_structural_keys
+                )
                 logger.info(
-                    "Epoch %d | Batch %d/%d | Loss %.5f (Pin %.5f [q90 %.5f, q10 %.5f], MS %.5f, Freq %.5f, "
-                    "L1 %.5f, Spectral %.5f, Gradient %.5f) | LR %.2e",
+                    "Epoch %d | Batch %d/%d | Loss %.5f (Pin %.5f [q90 %.5f, q10 %.5f]%s) | LR %.2e",
                     epoch, i + 1, len(train_loader),
                     running["total"] / log_every, running["pin"] / log_every,
                     running["pin90"] / log_every, running["pin10"] / log_every,
-                    running["ms"] / log_every, running["freq"] / log_every,
-                    running["l1"] / log_every, running["spectral"] / log_every,
-                    running["gradient"] / log_every,
+                    struct_str,
                     scheduler.get_last_lr()[0],
                 )
-                running = {k: 0.0 for k in LOSS_COMPONENT_KEYS}
+                running = {k: 0.0 for k in active_train_keys}
 
             if max_steps is not None and global_step >= max_steps:
                 logger.info("Reached --max-steps=%d, stopping early.", max_steps)
                 return
 
         if (epoch + 1) % val_interval == 0:
+            # Every structural term is computed here regardless of weight (compute_all),
+            # purely as a diagnostic -- see compute_weighted_loss.
             val_metrics = evaluate(model, val_loader, terrain_raw, device, weights, mean_aux,
                                    ms_loss_fn, freq_loss_fn, extreme_cfg)
             val_loss = val_metrics["total"]
@@ -540,8 +587,20 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
             save_checkpoint(checkpoint_dir / "last.pth", model, optimizer, scheduler, epoch, best_val_loss)
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                epochs_since_improvement = 0
                 save_checkpoint(checkpoint_dir / "best.pth", model, optimizer, scheduler, epoch, best_val_loss)
                 logger.info("New best val loss: %.5f (saved checkpoints/best.pth)", best_val_loss)
+            else:
+                epochs_since_improvement += 1
+                logger.info("Epoch %d | Val loss did not improve (%d/%s val checks since best=%.5f)",
+                            epoch, epochs_since_improvement,
+                            early_stop_patience if early_stop_patience > 0 else "inf", best_val_loss)
+                if early_stop_patience > 0 and epochs_since_improvement >= early_stop_patience:
+                    logger.info(
+                        "Epoch %d | Early stopping: no improvement for %d val check(s) (patience=%d).",
+                        epoch, epochs_since_improvement, early_stop_patience,
+                    )
+                    break
 
     logger.info("Training complete.")
 

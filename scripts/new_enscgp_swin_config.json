@@ -2,7 +2,7 @@
   "seed": 0,
   "paths": {
     "data_dir": "/home/peytonli/26.6_wind/data",
-    "log_dir": "/home/peytonli/26.6_wind/runs/0714",
+    "log_dir": "/home/peytonli/26.6_wind/runs/0729",
     "splits_path": "/home/peytonli/26.6_wind/data/splits_70_15_15/split_indices.npz"
   },
   "model": {
@@ -13,8 +13,7 @@
     "window_size": 8,
     "mlp_ratio": 4.0,
     "residual_base": "bicubic",
-    "residual_gate_init": 0.1,
-    "init_spread_scale": 1.28,
+    "offset_spread_init": 3.0,
     "drop_rate": 0.05,
     "attn_drop_rate": 0.05,
     "drop_path_rate": 0.1,
@@ -41,7 +40,6 @@
       "n_levels": 5,
       "base_sigma": 2,
       "metric_per_band": ["l1", "sw", "sw", "sw", "sw"],
-      "metric_scale": {"l1": 1.0, "sw": 2.75},
       "patch_size": 8,
       "patch_stride": 4,
       "n_projections": 64,
