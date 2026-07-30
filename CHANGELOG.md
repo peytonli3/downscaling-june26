@@ -96,6 +96,33 @@ its keep). Model-side changes are breaking; trainer/loss changes are not.
   `runs/0714_freq0/` ablation (100 epochs, everything else identical to the 0714 run) is
   on disk for a fuller before/after comparison.
 
+### Follow-up: sign-aware extreme weighting (non-breaking, post-0729)
+
+`extreme_pixel_weights` replaced by `extreme_pixel_weights_signed`. u and v are SIGNED
+quantities (a strong westward gust is exactly as extreme as an equally strong eastward
+one), which the original weighting didn't account for:
+
+- It ranked a single combined magnitude `sqrt(u^2+v^2)` and, when `apply_to_q10` was on,
+  reused the *identical* weight tensor for both q90 and q10 (`w10 = w90`) -- so every
+  extreme pixel pushed both tails equally hard regardless of which direction the extreme
+  was actually in.
+- The new version ranks `|target|` **per component**, independently for u and v (so a
+  pixel extreme only in u doesn't spuriously also weight v), then **routes** that one
+  shared weight scale by sign: q90's pinball is boosted where the component is positive,
+  q10's where negative (if `apply_to_q10`); the *other* tail gets baseline weight (1.0) at
+  that pixel, since it has nothing extreme to reach for there.
+- Important subtlety caught in review: ranking the positive and negative parts
+  *separately* (each independently mean-normalized) was tried first and is wrong -- on a
+  one-directional sample (e.g. severe negative gusts, only mild positive values), it would
+  boost the "most positive" pixel toward the same max weight as the true severe extreme,
+  even though it isn't actually severe in absolute terms. Ranking `|target|` once (so
+  "extreme" means the same thing on both sides) and only routing by sign fixes this.
+
+Verified with synthetic continuous data reproducing exactly that one-directional scenario:
+the true extreme gets ~max weight on its correct tail and baseline (1.0) on the other; a
+merely-locally-largest-but-not-actually-severe value on the opposite sign stays near
+baseline rather than being boosted.
+
 ---
 
 ## 0714  *(scripts/new_enscgp_swin.py + scripts/train_new_enscgp_swin.py)*

@@ -38,12 +38,14 @@ compute_weighted_loss / evaluate.
 
 Extreme weighting: rare high-wind pixels are a tiny fraction of the field, so an
 unweighted pinball under-trains them and q90 gets smoothed down off the damaging peaks.
-When training.extreme_weight.enabled, the q90 pinball (and, if apply_to_q10, the q10
-pinball) is multiplied by a per-pixel weight 1 + alpha * F(|truth|), where F is the
-per-sample empirical CDF (rank/N) of wind magnitude -- so peak pixels get up to ~(1+alpha)x
-weight. Weights are DETACHED (no gradient through the ranking) and mean-normalized per
-sample (so the loss scale is invariant to alpha). Calibration is checked post-hoc via
-coverage (see evaluate), NOT enforced by the loss.
+u and v are SIGNED (a strong westward gust is exactly as extreme as an equally strong
+eastward one), so extremity is judged from |target|'s per-component rank, then ROUTED to
+whichever tail the sign indicates: q90's pinball is up-weighted where that component is
+strongly positive, q10's (if apply_to_q10) where strongly negative -- see
+extreme_pixel_weights_signed. Weight = 1 + alpha * F(|target|), so peak pixels get up to
+~(1+alpha)x weight on the relevant tail only; DETACHED (no gradient through the ranking)
+and mean-normalized per (sample, component) so the loss scale is invariant to alpha.
+Calibration is checked post-hoc via coverage (see evaluate), NOT enforced by the loss.
 
 multiscale_loss (scripts/multiscale_loss.py) is now the PRIMARY mean-supervision term --
 a Laplacian-pyramid, displacement-tolerant (sliced-Wasserstein) loss built to replace the
@@ -168,29 +170,61 @@ class MeanAuxLosses:
         return torch.mean(torch.abs(divergence(mu) - divergence(target)))
 
 
-def extreme_pixel_weights(target: torch.Tensor, alpha: float, eps: float = 1e-6) -> torch.Tensor:
-    """Per-pixel weight 1 + alpha * F(|truth|), F = per-sample empirical CDF (rank/(N-1))
-    of wind magnitude |truth| = sqrt(u^2 + v^2). Peak-wind pixels approach weight (1+alpha);
-    bulk pixels ~1. DETACHED (no gradient through the ranking) and mean-normalized per
-    sample so the loss scale is invariant to alpha. Returns (B, 1, H, W)."""
+def _rank_cdf_per_channel(x: torch.Tensor) -> torch.Tensor:
+    """x: (B,C,H,W), non-negative. Empirical CDF (rank/(N-1)) computed independently within
+    each (batch, channel) slice's H*W pixels -- so u and v (or any two channels) are ranked
+    against their OWN distribution, not mixed together. Same shape as x."""
+    B, C, H, W = x.shape
+    flat = x.reshape(B, C, H * W)
+    n = flat.shape[-1]
+    ranks = flat.argsort(dim=-1).argsort(dim=-1).to(x.dtype)
+    cdf = ranks / max(n - 1, 1)
+    return cdf.reshape(B, C, H, W)
+
+
+def extreme_pixel_weights_signed(target: torch.Tensor, alpha: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sign-aware extreme weighting for a SIGNED quantity (wind components u, v can be
+    positive or negative -- a strong westward gust is exactly as extreme as an equally
+    strong eastward one). A SINGLE weight scale is computed from |target| -- so "how extreme
+    is this pixel" means the same thing regardless of direction -- then ROUTED per pixel to
+    whichever tail its sign indicates:
+      w = 1 + alpha * F(|target|)     F = empirical CDF within each (sample, component)
+                                       independently (_rank_cdf_per_channel), mean-normalized
+      w_upper = w where target >= 0, else 1 (baseline -- nothing extreme for q90 to reach there)
+      w_lower = w where target <  0, else 1 (baseline -- nothing extreme for q10 to reach there)
+    Returns (w_upper, w_lower), each (B,2,H,W). DETACHED (no gradient through the ranking).
+
+    Ranking the SIGNED value's magnitude directly (rather than ranking the positive and
+    negative parts separately, each renormalized on its own) matters: if a sample's wind is
+    overwhelmingly one-directional -- say strongly negative u with only mild positive
+    gusts -- the "most positive" pixel might be a modest +3 m/s, nowhere near as severe as
+    the -30 m/s on the other side. Two independently-normalized rankings would boost that
+    +3 m/s pixel toward the SAME max weight as the -30 m/s one, purely for being locally
+    largest on its own (mostly unremarkable) side. Ranking |target| once means a pixel's
+    weight reflects how extreme it actually is in absolute terms, comparable across both
+    signs; only the ROUTING (which tail receives it) depends on sign.
+
+    This replaces an earlier design that reused one magnitude-based weight identically for
+    both q90 and q10 (w10 = w90) with no sign-awareness at all: that version pushed both
+    tails equally hard at every extreme pixel regardless of which direction the extreme was
+    in, wasting half the pressure on a tail that had nothing to reach for there.
+    """
     with torch.no_grad():
-        mag = torch.sqrt(target[:, 0:1] ** 2 + target[:, 1:2] ** 2 + eps)  # (B,1,H,W)
-        B = mag.shape[0]
-        flat = mag.reshape(B, -1)
-        n = flat.shape[1]
-        # empirical CDF via double-argsort ranks in [0, 1]
-        ranks = flat.argsort(dim=1).argsort(dim=1).to(mag.dtype)
-        cdf = ranks / max(n - 1, 1)
-        w = 1.0 + alpha * cdf.reshape_as(mag)
-        w = w / w.mean(dim=(1, 2, 3), keepdim=True)  # mean-normalize per sample
-    return w
+        w = 1.0 + alpha * _rank_cdf_per_channel(target.abs())
+        w = w / w.mean(dim=(2, 3), keepdim=True)  # mean-normalize per (B, C)
+        is_pos = target >= 0
+        ones = torch.ones_like(w)
+        w_upper = torch.where(is_pos, w, ones)
+        w_lower = torch.where(is_pos, ones, w)
+    return w_upper, w_lower
 
 
 def pinball_loss(q: torch.Tensor, target: torch.Tensor, tau: float,
                  weight: torch.Tensor | None = None) -> torch.Tensor:
     """Mean pinball (tilted-L1) loss for quantile level tau: err = target - q;
     loss = max(tau*err, (tau-1)*err) per pixel (== tau*err if target>q else (1-tau)*(q-target)).
-    Fully differentiable in q. weight (B,1,H,W) broadcasts over the u/v channels if given."""
+    Fully differentiable in q. weight is (B,2,H,W) (per-component) or (B,1,H,W) (broadcasts
+    over both components) if given."""
     err = target - q
     loss = torch.maximum(tau * err, (tau - 1.0) * err)  # (B, 2, H, W)
     if weight is not None:
@@ -218,7 +252,10 @@ def compute_weighted_loss(pred: torch.Tensor, target: torch.Tensor, weights: dic
     diagnostic -- see evaluate().
 
     extreme_cfg (or None = off): {"enabled": bool, "alpha": float, "apply_to_q10": bool}.
-    When enabled, up-weights high-wind pixels in the q90 pinball (and q10 if apply_to_q10).
+    When enabled, up-weights q90's pinball wherever that component is strongly positive
+    (and, if apply_to_q10, q10's wherever it's strongly negative) -- see
+    extreme_pixel_weights_signed. u and v can each be positive or negative, so this is a
+    sign-aware, per-component weighting, not a single shared magnitude-based one.
 
     Returns a dict with every component (all detached except "total", which carries the
     graph); a skipped structural term's value is None.
@@ -235,9 +272,10 @@ def compute_weighted_loss(pred: torch.Tensor, target: torch.Tensor, weights: dic
 
     w90 = w10 = None
     if extreme_cfg is not None and extreme_cfg.get("enabled", False):
-        w90 = extreme_pixel_weights(target, extreme_cfg.get("alpha", 1.0))
+        w_upper, w_lower = extreme_pixel_weights_signed(target, extreme_cfg.get("alpha", 1.0))
+        w90 = w_upper
         if extreme_cfg.get("apply_to_q10", False):
-            w10 = w90
+            w10 = w_lower
     pin90 = pinball_loss(q90, target, 0.9, w90)
     pin10 = pinball_loss(q10, target, 0.1, w10)
     pin = pin90 + pin10
