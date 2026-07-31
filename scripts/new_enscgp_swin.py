@@ -34,16 +34,17 @@ x = cat([model_input, terrain_encoder(terrain_raw)], dim=1) feeds conv_first.
 
 Heads -- two different residual styles, chosen per head's role:
 - mean_head (the q50 / central head): 2 channels (q50_u, q50_v). Output =
-  mean_base + head(feats), where mean_base is selected by residual_base
-  ("enscgp" (default) -> EnsCGP posterior mean, "bicubic" -> bicubic baseline,
-  "none" -> zero). The head's final conv is NEAR-ZERO initialized
-  (MEAN_HEAD_INIT_STD), so a fresh model's output starts essentially equal to
-  mean_base -- the pre-0629 approach. v0629-v0714 instead used a full-strength
-  (Kaiming) head gated by a learnable scalar (mean_gate) to avoid a theoretical
-  vanishing-upstream-gradient concern with near-zero init; in practice mean_gate
-  settled at ~0.125 after a full training run (barely above its 0.1 init),
-  indicating the concern cost little here -- so the gate was dropped (v7) in favor
-  of the simpler near-zero-init scheme it was designed to replace.
+  mean_base + mean_gate * head(feats), where mean_base is selected by
+  residual_base ("enscgp" (default) -> EnsCGP posterior mean, "bicubic" ->
+  bicubic baseline, "none" -> zero). RESTORED (post-0729 ablation, see
+  CHANGELOG): the head's final conv is back to full-strength Kaiming-normal
+  init, gated by a learnable scalar mean_gate (init 0.1) -- the v0629-v0714
+  design. v7/0729 had switched this to a near-zero-init head with no gate,
+  reasoning that mean_gate settling at ~0.125 after a full 0714 run (barely
+  above its 0.1 init) meant the gate wasn't doing much; that run's results were
+  measurably worse than 0714's across every metric, so this ablation restores
+  ONLY mean_gate (not offset_head's EnsCGP-seed or the input decomposition,
+  both still removed) to isolate whether this specific change was responsible.
   q50 keeps EXACTLY the role the old mean had: it is the field the structural
   losses (multi-scale Wasserstein + frequency-L1) train, so it stays sharp. It is
   NOT pinball-trained (that would pull it toward the blurry pointwise median and
@@ -82,15 +83,15 @@ new_enscgp_swin_config.json). in_chans is not configurable: it's INPUT_CHANNELS 
 terrain encoder's actual output channels.
 
 NOTE: this is a checkpoint-incompatible change from the 0714 quantile version (see
-CHANGELOG "0729"): mean_gate/offset_gate are gone, mean_head is near-zero (not
-Kaiming) initialized, and the offset head no longer reads the EnsCGP Cholesky as a
-seed. mean_head/offset_head/backbone/terrain_encoder weights still transfer from a
-0714 checkpoint by shape (their module structure/output shapes are unchanged) via
+CHANGELOG "0729" and the mean_gate-restoration ablation entry that follows it):
+offset_gate is gone and the offset head no longer reads the EnsCGP Cholesky as a
+seed; mean_gate is back (restored post-0729). mean_head/offset_head/backbone/
+terrain_encoder weights still transfer from a 0714 checkpoint by shape via
 --resume-weights-only -- EXCEPT conv_first, whose weight shape also happens to be
 unchanged (still 11 input channels) but whose channels 2-3 now carry raw EnsCGP u/v
 instead of an EnsCGP-minus-bicubic residual: a naive partial load will transfer
 conv_first's weights despite this semantic change, likely to a worse starting point
-than training conv_first fresh. Prefer starting v7 fresh from EnsCGP unless you
+than training conv_first fresh. Prefer starting fresh from EnsCGP unless you
 explicitly want to test resuming through that channel-semantics change.
 
 Usage:
@@ -122,12 +123,11 @@ class ProbabilisticSwin2SR(Swin2SR):
     Q50_SLICE = slice(2, 4)
     Q90_SLICE = slice(4, 6)
     RESIDUAL_BASES = ("enscgp", "bicubic", "none")
-    MEAN_HEAD_INIT_STD = 1e-3  # near-zero final-conv weight std for mean_head (q50 starts at its base)
     OFFSET_EPS = 1e-3          # hard floor on each quantile offset -- spread can't underflow to 0
 
     def __init__(self, img_size=200, embed_dim=96,
                  depths=(4, 4, 4), num_heads=(6, 6, 6), window_size=8,
-                 mlp_ratio=4., residual_base="enscgp",
+                 mlp_ratio=4., residual_base="enscgp", residual_gate_init=0.1,
                  offset_spread_init=3.0, head_dropout=0.0, **kwargs):
         # Backbone dropout knobs (drop_rate / attn_drop_rate / drop_path_rate) flow
         # through **kwargs to Swin2SR; head_dropout is consumed here. All default to
@@ -152,11 +152,12 @@ class ProbabilisticSwin2SR(Swin2SR):
         self.residual_base = residual_base
         self.offset_spread_init = float(offset_spread_init)
         self.head_dropout = head_dropout
-        # mean_head: near-zero final-conv weight -> fresh output ~= 0, so q50 starts at
-        # exactly mean_base. offset_head: full-strength (Kaiming) final-conv weight with a
-        # nonzero BIAS, so softplus(raw) starts near offset_spread_init on every pixel
-        # rather than depending on any external seed. See module docstring.
-        self.mean_head = self._make_head(embed_dim, 2, near_zero=True)
+        # mean_head: full-strength (Kaiming) final-conv weight, gated by mean_gate (RESTORED,
+        # see module docstring) -- output = mean_base + mean_gate*head(feats). offset_head:
+        # full-strength (Kaiming) final-conv weight with a nonzero BIAS, so softplus(raw)
+        # starts near offset_spread_init on every pixel, no gate. See module docstring.
+        self.mean_head = self._make_head(embed_dim, 2)
+        self.mean_gate = nn.Parameter(torch.tensor(float(residual_gate_init)))
         offset_bias = self._inverse_softplus(self.offset_spread_init)
         self.offset_head = self._make_head(embed_dim, 4, bias_init=offset_bias)
 
@@ -167,21 +168,19 @@ class ProbabilisticSwin2SR(Swin2SR):
         training: softplus(inverse_softplus(x)) == x."""
         return math.log(math.expm1(x))
 
-    @classmethod
-    def _make_head(cls, embed_dim: int, out_channels: int, near_zero: bool = False,
-                    bias_init: float = 0.0) -> nn.Sequential:
+    @staticmethod
+    def _make_head(embed_dim: int, out_channels: int, bias_init: float = 0.0) -> nn.Sequential:
         # conv -> LeakyReLU -> conv. head_dropout (when > 0) is applied functionally in
         # _head_forward between activation and final conv, NOT as a module here, so the
-        # state_dict layout is identical for every head_dropout value.
+        # state_dict layout is identical for every head_dropout value. Both heads use
+        # full-strength Kaiming init -- mean_head relies on mean_gate (not a suppressed
+        # weight) to start gentle; offset_head relies on bias_init instead of a gate.
         head = nn.Sequential(
             nn.Conv2d(embed_dim, embed_dim, 3, 1, 1),
             nn.LeakyReLU(negative_slope=LEAKY_SLOPE, inplace=True),
             nn.Conv2d(embed_dim, out_channels, 3, 1, 1),
         )
-        if near_zero:
-            nn.init.normal_(head[-1].weight, std=cls.MEAN_HEAD_INIT_STD)
-        else:
-            nn.init.kaiming_normal_(head[-1].weight, a=LEAKY_SLOPE, nonlinearity="leaky_relu")
+        nn.init.kaiming_normal_(head[-1].weight, a=LEAKY_SLOPE, nonlinearity="leaky_relu")
         nn.init.constant_(head[-1].bias, bias_init)
         return head
 
@@ -228,7 +227,7 @@ class ProbabilisticSwin2SR(Swin2SR):
         x_first = self.conv_first(x)
         feats = self.conv_after_body(self.forward_features(x_first)) + x_first
 
-        q50 = mean_base + self._head_forward(self.mean_head, feats)
+        q50 = mean_base + self.mean_gate * self._head_forward(self.mean_head, feats)
 
         raw = self._head_forward(self.offset_head, feats)  # [up_u, up_v, down_u, down_v]
         up = self._quantile_offset(raw[:, 0:2])
@@ -257,6 +256,7 @@ def build_model(config: dict) -> ProbabilisticSwin2SR:
         window_size=m.get("window_size", 8),
         mlp_ratio=m.get("mlp_ratio", 4.0),
         residual_base=m.get("residual_base", "enscgp"),
+        residual_gate_init=m.get("residual_gate_init", 0.1),
         offset_spread_init=m.get("offset_spread_init", 3.0),
         head_dropout=m.get("head_dropout", 0.0),
         drop_rate=m.get("drop_rate", 0.0),
@@ -319,15 +319,17 @@ def _smoke_test(config: dict):
     assert torch.all(up >= model.OFFSET_EPS - 1e-6), "up offset underflowed OFFSET_EPS"
     assert torch.all(down >= model.OFFSET_EPS - 1e-6), "down offset underflowed OFFSET_EPS"
 
-    # Fresh model: mean_head is near-zero init, so q50 should track its residual_base
-    # TIGHTLY (no gate to loosen the bound -- just near-zero-weight randomness).
+    # Fresh model: q50 tracks its residual_base within a gate-scaled margin (mean_head is
+    # full-strength Kaiming; mean_gate, not a suppressed weight, keeps a fresh model's
+    # contribution small).
     base_map = {"enscgp": posterior[:, :2], "bicubic": bicubic, "none": torch.zeros_like(bicubic)}
     mean_base = base_map[model.residual_base]
+    gate = model.mean_gate.item()
     mean_diff = (q50 - mean_base).abs().max().item()
-    mean_bound = 0.05  # near-zero-init (std=1e-3) output should be tiny, not gate-scaled
+    mean_bound = max(0.5, 5 * gate)
     assert mean_diff < mean_bound, (
-        f"fresh q50 should track its {model.residual_base!r} base tightly (near-zero-init "
-        f"mean_head, bound={mean_bound}), got max abs diff {mean_diff:.4f}"
+        f"fresh q50 should track its {model.residual_base!r} base within a gate-scaled "
+        f"margin (gate={gate:.3f}, bound={mean_bound:.3f}), got max abs diff {mean_diff:.4f}"
     )
 
     # Fresh model: offset head's bias is initialized so up/down start near
@@ -342,9 +344,9 @@ def _smoke_test(config: dict):
         f"got up_diff={up_diff:.4f}, down_diff={down_diff:.4f}"
     )
 
-    # Gradient sanity: offset_head is full-strength (Kaiming), so gradient flows to the
-    # backbone and terrain encoder strongly from step 0; mean_head is near-zero-init but
-    # must still receive gradient (it's what allows it to grow away from zero at all).
+    # Gradient sanity: both heads are full-strength (Kaiming), so gradient flows to the
+    # backbone and terrain encoder strongly from step 0, and mean_gate itself must receive
+    # gradient (it's what training has to grow).
     model.zero_grad()
     out_grad = model(posterior, bicubic, terrain_raw)
     out_grad.pow(2).mean().backward()
@@ -357,10 +359,11 @@ def _smoke_test(config: dict):
     assert mean_head_grad is not None and mean_head_grad.abs().max().item() > 0, "mean_head received no gradient"
     offset_head_grad = model.offset_head[-1].weight.grad
     assert offset_head_grad is not None and offset_head_grad.abs().max().item() > 0, "offset_head received no gradient"
+    assert model.mean_gate.grad is not None and model.mean_gate.grad.abs().item() > 0, "mean_gate received no gradient"
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Output shape: {tuple(out.shape)}  (ordered [q10_u,q10_v, q50_u,q50_v, q90_u,q90_v])")
-    print(f"residual_base={model.residual_base!r}, offset_spread_init={model.offset_spread_init}")
+    print(f"residual_base={model.residual_base!r}, mean_gate={gate:.4f}, offset_spread_init={model.offset_spread_init}")
     print(f"up  offset range: [{up.min().item():.4f}, {up.max().item():.4f}]")
     print(f"down offset range: [{down.min().item():.4f}, {down.max().item():.4f}]")
     print(f"max|q50 - {model.residual_base} base| (fresh): {mean_diff:.4f} (bound {mean_bound})")
