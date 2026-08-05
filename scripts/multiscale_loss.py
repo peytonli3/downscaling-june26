@@ -1,7 +1,7 @@
 """Multi-scale, displacement-tolerant loss for the mean prediction (mu_u, mu_v) of
 new_enscgp_swin.py's ProbabilisticSwin2SR.
 
-Motivation: a per-band error diagnostic (extra_scripts/band_error_diagnostics.py) found
+Motivation: a per-band error diagnostic (extra_scripts/swin/oneoff/band_error_diagnostics.py) found
 the dominant error against WRF truth is RANDOM SPATIAL DISPLACEMENT at every scale (not
 amplitude), worst at 8-32 km. Pointwise losses (L1, etc.) reward smoothing instead of
 correcting displacement, since shifting a sharp structure by a few pixels costs as much
@@ -15,7 +15,7 @@ Pipeline
    base_sigma * 2^(k-1)), differences between successive blurs; the coarsest level is the
    low-pass residual. Bands sum back to the field exactly (asserted in self_test below).
    Pure torch (depthwise separable conv2d, reflect-padded), differentiable, GPU-resident --
-   ported from extra_scripts/band_error_diagnostics.py's numpy/scipy version.
+   ported from extra_scripts/swin/oneoff/band_error_diagnostics.py's numpy/scipy version.
 
 2. Per band, per component (u, v) -- summed over both:
      band_loss = METRIC_SCALE[metric] * D_band(pred_band, truth_band) / (sigma_band[band, component] + eps)
@@ -66,7 +66,7 @@ Pipeline
 Tuning guardrail (read before raising ms_weight in new_enscgp_swin_config.json; post-0714,
 uncertainty is trained by pinball on q10/q90, not NLL -- this only concerns q50):
 raise ms_weight GRADUALLY from 0. After each bump, check:
-  - the eigenspectrum (compare_eigenspectra_enscgp_swin.py) should rise toward WRF, not
+  - the eigenspectrum (compare_eigenspectra.py) should rise toward WRF, not
     away from it.
   - coverage / the PIT histogram (eval_quantile_calibration.py) shouldn't move much --
     ms_weight only supervises q50, so a shift there suggests q50 and the offset head are
@@ -315,20 +315,56 @@ class FreqBandLoss:
       largest-magnitude pixels so the loss focuses on mid-range structure.
     cdf_weight_mode='up_extremes': weight = F(|m|), opposite.
 
+    band_weight (default None, i.e. all 1.0 -- backward-compatible no-op): optional per-band
+      multiplier, COARSE -> FINE like metric_per_band (see DEFAULT_METRIC_PER_BAND), len ==
+      n_levels. A 0.0 entry fully deactivates that band (skipped, not just zero-weighted --
+      no irfft2/pixel-weight cost for it). Motivating case: the finest band is the raw-grid
+      Laplacian residual, which on this data is dominated by unresolvable grid noise rather
+      than real structure (see multiscale_loss.py's module docstring point 2) -- down-
+      weighting or zeroing band_weight[-1] stops the loss from chasing that noise.
+
+    pixel_weight_enabled (default None, i.e. all True -- backward-compatible no-op): optional
+      per-band bool, COARSE -> FINE like band_weight, len == n_levels. False makes that band's
+      L1 UNWEIGHTED (pw=1 for every pixel) instead of applying the down_extremes/up_extremes
+      CDF weight -- independent of band_weight, which scales the whole band's contribution
+      rather than changing how pixels within it are weighted. Motivating evidence
+      (extra_scripts/swin/band_crossover_diagnostic.py's Part 1 weighted-vs-unweighted
+      breakdown): at some bands, bicubic only beats SWIN's freq_l1 because of the down_extremes
+      weighting -- the gap shrinks to noise (or reverses) once that band is scored unweighted,
+      while swd/melr (which don't use this weighting at all) already favor SWIN there. That
+      band's "SWIN loses" signal is a weighting artifact, not a real placement deficit -- so
+      the fix is disabling the weighting AT THAT BAND specifically, not discarding the band via
+      band_weight (which would also discard the real, correctly-supervising L1 gradient there).
+      At other bands, the same diagnostic found the weighted-vs-unweighted gap does NOT vanish
+      -- a real, unavoidable pointwise-L1 effect survives regardless of weighting -- so
+      band_weight (not this) is the right lever there.
+
     Set freq_weight=0.0 in the training config for a zero-cost no-op (default)."""
 
     def __init__(self, sigma_band: torch.Tensor, n_levels: int = 5, base_sigma: float = 2.0,
                  cdf_weight_mode: str = "down_extremes", sigma_floor: float = 1e-3,
-                 eps: float = 1e-8):
+                 eps: float = 1e-8, band_weight: tuple[float, ...] | None = None,
+                 pixel_weight_enabled: tuple[bool, ...] | None = None):
         if sigma_band.shape != (n_levels, 2):
             raise ValueError(f"sigma_band must have shape ({n_levels}, 2), got {tuple(sigma_band.shape)}")
         if cdf_weight_mode not in ("down_extremes", "up_extremes"):
             raise ValueError(f"cdf_weight_mode must be 'down_extremes' or 'up_extremes', got {cdf_weight_mode!r}")
+        if band_weight is not None and len(band_weight) != n_levels:
+            raise ValueError(f"band_weight must have length n_levels={n_levels}, got {len(band_weight)}")
+        if pixel_weight_enabled is not None and len(pixel_weight_enabled) != n_levels:
+            raise ValueError(f"pixel_weight_enabled must have length n_levels={n_levels}, "
+                             f"got {len(pixel_weight_enabled)}")
         self.n_levels = n_levels
         self.base_sigma = base_sigma
         self.cdf_weight_mode = cdf_weight_mode
         self.eps = eps
         self.sigma_band = sigma_band.clamp_min(sigma_floor)
+        # Both stored FINEST -> COARSEST (band b=0 in __call__'s loop is finest -- see
+        # _get_masks), the reverse of the constructor's coarse -> fine input, mirroring how
+        # MultiscaleLoss.__call__ reverses metric_per_band against the same band order.
+        self.band_weight = tuple(reversed(band_weight)) if band_weight is not None else (1.0,) * n_levels
+        self.pixel_weight_enabled = (tuple(reversed(pixel_weight_enabled)) if pixel_weight_enabled is not None
+                                     else (True,) * n_levels)
         self._mask_cache: dict = {}
 
     def _get_masks(self, H: int, W: int, device, dtype) -> list[torch.Tensor]:
@@ -365,13 +401,22 @@ class FreqBandLoss:
 
         total = pred_mean.new_zeros(())
         for b, mask in enumerate(masks):
+            w = self.band_weight[b]
+            if w == 0.0:
+                continue  # fully deactivated: skip this band's irfft2/pixel-weight cost too
             pred_band = torch.fft.irfft2(mask * pred_F, s=(H, W))
             truth_band = torch.fft.irfft2(mask * truth_F, s=(H, W))
+            weight_this_band = self.pixel_weight_enabled[b]
             for c in range(2):
                 p = pred_band[:, c:c + 1]
                 t = truth_band[:, c:c + 1]
-                pw = self._pixel_weights(t.abs().detach())
-                total = total + (pw * (p - t).abs()).mean() / (sigma[b, c] + self.eps)
+                abs_err = (p - t).abs()
+                if weight_this_band:
+                    pw = self._pixel_weights(t.abs().detach())
+                    band_term = (pw * abs_err).mean()
+                else:
+                    band_term = abs_err.mean()  # unweighted: skip the rank/CDF cost entirely
+                total = total + w * band_term / (sigma[b, c] + self.eps)
         return total
 
 

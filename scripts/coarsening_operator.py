@@ -27,7 +27,9 @@ from pathlib import Path
 import numpy as np
 import scipy.sparse as sp
 
-DEFAULT_CACHE_PATH = "/home/peytonli/26.6_wind/data/coarsening_operator_H.npy"
+from paths import DATA_DIR, WNDATA_MAT
+
+DEFAULT_CACHE_PATH = DATA_DIR / "coarsening_operator_H.npy"
 
 
 def _cell_bounds(centers: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -173,7 +175,7 @@ def get_coarsening_operator(
     hr_lon: np.ndarray,
     lr_lat: np.ndarray,
     lr_lon: np.ndarray,
-    cache_path: str = DEFAULT_CACHE_PATH,
+    cache_path: str | Path = DEFAULT_CACHE_PATH,
 ) -> tuple[sp.csr_matrix, np.ndarray]:
     """Load (H, valid) from cache_path if present, else build and cache it."""
     if Path(cache_path).exists():
@@ -186,7 +188,7 @@ def get_coarsening_operator(
 if __name__ == "__main__":
     import h5py
 
-    mat_path = "/net/momo/data/projects/downscaling/datasource/wndata.mat"
+    mat_path = WNDATA_MAT
     with h5py.File(mat_path, "r") as f:
         era_lat = f["eralats"][()].ravel()
         era_lon = f["eralons"][()].ravel()

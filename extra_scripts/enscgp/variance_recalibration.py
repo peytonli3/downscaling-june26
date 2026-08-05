@@ -40,13 +40,18 @@ Smoke test (synthetic data, no files needed):
 """
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 from sklearn.isotonic import IsotonicRegression
 
-DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+REPO = next(p for p in Path(__file__).resolve().parents
+            if (p / "scripts" / "paths.py").is_file())
+sys.path.insert(0, str(REPO / "scripts"))
+
+from paths import DATA_DIR as DEFAULT_DATA_DIR  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

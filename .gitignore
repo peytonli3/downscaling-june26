@@ -5,25 +5,23 @@
 data/*
 !data/README.md
 
-# Checkpoints
-*.pth
-
-# Numpy arrays
-*.npy
-*.npz
-
-# Optuna studies
-*.db
-
-# Figures (regenerable from scripts)
-*.png
+# Per-run outputs. Small text (*.log, *.csv, config.json) is tracked as cheap
+# history; the heavy regenerable artifacts are not.
+runs/*/checkpoints/
+runs/*/figures/*
+!runs/*/figures/*.csv
+runs/*/presentation/*.pptx
 
 # Python caches
 __pycache__/
 *.pyc
 
-# On-disk archive of dead artifacts (recoverable code is in git tags)
-_archive/
+# Optuna studies
+*.db
 
-# Generated presentation binaries
-*.pptx
+# Scratch
+*.swp
+.DS_Store
+
+# Figures belong under runs/<version>/figures/ (ignored above). Anything under
+# docs/ is a deliberately committed illustration, so it is NOT ignored here.

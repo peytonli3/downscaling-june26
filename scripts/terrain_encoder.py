@@ -86,9 +86,10 @@ def load_terrain_input(data_dir: Path) -> torch.Tensor:
 
 
 if __name__ == "__main__":
-    data_dir = Path(__file__).resolve().parent.parent / "data"
+    from paths import DATA_DIR
+
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--output", type=Path, default=data_dir / "terrain_features.npy")
+    parser.add_argument("--output", type=Path, default=DATA_DIR / "terrain_features.npy")
     parser.add_argument("--seed", type=int, default=42, help="Encoder weights are randomly initialized (untrained); fixes them for reproducibility")
     args = parser.parse_args()
 

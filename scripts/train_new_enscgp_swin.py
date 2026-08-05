@@ -47,10 +47,21 @@ extreme_pixel_weights_signed. Weight = 1 + alpha * F(|target|), so peak pixels g
 and mean-normalized per (sample, component) so the loss scale is invariant to alpha.
 Calibration is checked post-hoc via coverage (see evaluate), NOT enforced by the loss.
 
+Checkpoint selection / early stopping run on val CRPS by default, NOT on the total loss
+("training.selection_metric", one of SELECTION_METRICS; set it to "total" for the old
+behavior). Two reasons the total is a bad selector. (1) It is not the same quantity across
+runs: evaluate() applies the run's own extreme_cfg to the Pin term, so a run with
+alpha=1.5/apply_to_q10=False is selecting on a different functional than one with
+alpha=2.0/apply_to_q10=True. (2) It is dominated by MS (~40% of its magnitude), which is
+batch-pooled and therefore moves with batch_size and batch composition rather than with skill
+-- see the caveat in evaluate(). CRPS is unweighted, per-sample, identical for every run, and
+is the metric extra_scripts/swin/eval_model_scorecard.py scores checkpoints on, so
+what the run optimizes for and what the scorecard reports are finally the same thing.
+
 multiscale_loss (scripts/multiscale_loss.py) is now the PRIMARY mean-supervision term --
 a Laplacian-pyramid, displacement-tolerant (sliced-Wasserstein) loss built to replace the
 legacy l1/spectral/gradient stack, which a per-band error diagnostic
-(extra_scripts/band_error_diagnostics.py) found rewards smoothing instead of correcting the
+(extra_scripts/swin/oneoff/band_error_diagnostics.py) found rewards smoothing instead of correcting the
 dominant error mode (random spatial displacement at every scale). The active config
 ("new_enscgp_swin_config.json") sets l1_weight/spectral_weight/gradient_weight to 0.0 and
 ms_weight > 0 -- each structural weight is still independently toggleable/zeroable (e.g. to
@@ -87,6 +98,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from new_enscgp_swin import DEFAULT_CONFIG_PATH, ProbabilisticSwin2SR, build_model, load_config
+from paths import resolve as resolve_path
 from terrain_encoder import load_terrain_input
 from multiscale_loss import DEFAULT_METRIC_PER_BAND, METRIC_SCALE, FreqBandLoss, MultiscaleLoss, load_or_compute_sigma_band
 
@@ -232,6 +244,29 @@ def pinball_loss(q: torch.Tensor, target: torch.Tensor, tau: float,
     return loss.mean()
 
 
+# 3-quantile CRPS. With only q10/q50/q90 available, the CRPS integral
+# int (F(x) - 1{x>=y})^2 dx is approximated by a midpoint rule over the quantile levels:
+# CRPS ~= 2 * sum_k w_k * pinball(q_k, y, tau_k) with w = (0.3, 0.4, 0.3) for
+# tau = (0.1, 0.5, 0.9) -- the same weights eval_model_scorecard.py and
+# _v6_common.crps_3q_approx use, so the numbers are directly comparable.
+CRPS_TAUS = (0.1, 0.5, 0.9)
+CRPS_WEIGHTS = (0.3, 0.4, 0.3)
+
+
+@torch.no_grad()
+def crps_3q(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Scalar 3-quantile CRPS. Deliberately UNWEIGHTED -- unlike the Pin term in
+    compute_weighted_loss, no extreme_cfg is applied. That is the whole point of using it to
+    select checkpoints: extreme weighting differs between runs (alpha, apply_to_q10, and the
+    pre/post-12fc4bb weighting implementation), so a run's own Pin/total is not comparable to
+    another run's, while this is the same functional for every run and every model."""
+    slices = (ProbabilisticSwin2SR.Q10_SLICE, ProbabilisticSwin2SR.Q50_SLICE,
+              ProbabilisticSwin2SR.Q90_SLICE)
+    total = sum(w * pinball_loss(pred[:, sl], target, tau)
+                for tau, w, sl in zip(CRPS_TAUS, CRPS_WEIGHTS, slices))
+    return 2.0 * total
+
+
 def compute_weighted_loss(pred: torch.Tensor, target: torch.Tensor, weights: dict, mean_aux: MeanAuxLosses,
                            ms_loss_fn: MultiscaleLoss | None = None,
                            freq_loss_fn: FreqBandLoss | None = None,
@@ -311,13 +346,18 @@ def setup_logging(log_dir: Path) -> logging.Logger:
     return logger
 
 
-def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, best_val_loss: float):
+def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int, best_val_score: float,
+                     selection_metric: str):
     torch.save({
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "epoch": epoch,
-        "best_val_loss": best_val_loss,
+        "best_val_score": best_val_score,
+        "selection_metric": selection_metric,
+        # Kept so checkpoints stay readable by tooling written against the old field name.
+        # Pre-selection_metric checkpoints only have this one, and it always meant "total".
+        "best_val_loss": best_val_score,
     }, path)
 
 
@@ -327,6 +367,15 @@ ALWAYS_KEYS = ("total", "pin", "pin90", "pin10")
 STRUCTURAL_KEYS = ("ms", "freq", "l1", "spectral", "gradient")
 STRUCTURAL_LABELS = {"ms": "MS", "freq": "Freq", "l1": "L1", "spectral": "Spectral", "gradient": "Gradient"}
 LOSS_COMPONENT_KEYS = ALWAYS_KEYS + STRUCTURAL_KEYS  # evaluate() always computes all of these
+# Computed by evaluate() outside compute_weighted_loss (it is not a loss term and carries no
+# extreme weighting), so accumulated separately from LOSS_COMPONENT_KEYS.
+VAL_EXTRA_KEYS = ("crps",)
+
+# Metrics that may be named by training.selection_metric. Each is "lower is better" and each
+# is reported by evaluate(). "total" is the historical behavior and the ONLY one that depends
+# on the run's own loss weights and extreme_cfg -- which is exactly why it is a poor choice
+# for comparing across runs; see crps_3q.
+SELECTION_METRICS = ("crps", "l1", "total")
 # Coverage = fraction of truth pixels at or below each predicted quantile (target nominal
 # in parentheses). "_ext" variants restrict to the extreme tail (|wind| above its per-sample
 # 90th percentile) -- the damage-relevant region where q90 must actually reach the peaks.
@@ -361,12 +410,21 @@ def evaluate(model, loader, terrain_raw, device, weights: dict, mean_aux: MeanAu
              ms_loss_fn: MultiscaleLoss | None = None,
              freq_loss_fn: FreqBandLoss | None = None,
              extreme_cfg: dict | None = None) -> dict:
-    """Returns per-sample-averaged loss components plus empirical coverage (see
-    compute_weighted_loss / coverage_metrics). Every structural term is computed
+    """Returns per-sample-averaged loss components, CRPS, and empirical coverage (see
+    compute_weighted_loss / crps_3q / coverage_metrics). Every structural term is computed
     (compute_all=True) regardless of its weight -- this is the one place they're always
-    visible, even while off during training; see compute_weighted_loss."""
+    visible, even while off during training; see compute_weighted_loss.
+
+    CAVEAT on "ms" (and only "ms"): MultiscaleLoss pools its sliced-Wasserstein patches across
+    the WHOLE batch, so its value depends on both the batch SIZE and the batch COMPOSITION --
+    measured, same checkpoint, val MS falls ~50% going from batch_size 2 to 32, and an
+    event-clustered batch reads ~30% higher than a shuffled one of the same size. The val
+    loader is built with shuffle=False (batches are consecutive hours of one storm) while the
+    train loader shuffles, so val "MS" here is NOT on the same scale as the train MS in the
+    per-batch log lines, and neither is comparable across runs with different batch_size. Read
+    it as a within-run, fixed-batch_size trend only; use crps/l1 for anything else."""
     model.eval()
-    totals = {k: 0.0 for k in LOSS_COMPONENT_KEYS}
+    totals = {k: 0.0 for k in LOSS_COMPONENT_KEYS + VAL_EXTRA_KEYS}
     cov_below = {k: 0 for k in COVERAGE_KEYS}
     cov_total = {k: 0 for k in COVERAGE_KEYS}
     n = 0
@@ -380,6 +438,7 @@ def evaluate(model, loader, terrain_raw, device, weights: dict, mean_aux: MeanAu
         b = posterior.shape[0]
         for k in LOSS_COMPONENT_KEYS:
             totals[k] += loss_dict[k].item() * b
+        totals["crps"] += crps_3q(pred, wrf).item() * b
         for k, (below, tot) in coverage_metrics(pred, wrf).items():
             cov_below[k] += below
             cov_total[k] += tot
@@ -396,10 +455,12 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
     torch.manual_seed(seed)
     np.random.seed(seed)
 
+    # Config paths may be absolute or repo-relative; resolve() honours the former
+    # and anchors the latter at the repo root, so a clone runs unedited.
     paths = config["paths"]
-    data_dir = Path(paths["data_dir"])
-    log_dir = Path(paths["log_dir"])
-    splits_path = Path(paths["splits_path"])
+    data_dir = resolve_path(paths["data_dir"])
+    log_dir = resolve_path(paths["log_dir"])
+    splits_path = resolve_path(paths["splits_path"])
 
     logger = setup_logging(log_dir)
     logger.info("Config:\n%s", json.dumps(config, indent=2))
@@ -444,7 +505,12 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
         "LR schedule: milestones (steps) = %s (of %d total), gamma = %.3f", lr_milestones, total_steps, lr_gamma
     )
 
-    start_epoch, best_val_loss = 0, float("inf")
+    selection_metric = t.get("selection_metric", "crps")
+    if selection_metric not in SELECTION_METRICS:
+        raise ValueError(f"training.selection_metric must be one of {SELECTION_METRICS}, "
+                         f"got {selection_metric!r}")
+
+    start_epoch, best_val_score = 0, float("inf")
     checkpoint_dir = log_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -479,8 +545,22 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
             start_epoch = ckpt["epoch"] + 1
-            best_val_loss = ckpt["best_val_loss"]
-            logger.info("Resumed from %s at epoch %d (best_val_loss=%.5f)", resume_path, start_epoch, best_val_loss)
+            # Pre-selection_metric checkpoints carry only "best_val_loss", which always meant
+            # "total". Carrying that number over as the running best of a DIFFERENT metric
+            # would be meaningless (a total of ~4.8 vs a CRPS of ~1.1 never improves), so the
+            # best resets and the next val check re-establishes it under the new metric.
+            ckpt_metric = ckpt.get("selection_metric", "total")
+            if ckpt_metric == selection_metric:
+                best_val_score = ckpt.get("best_val_score", ckpt["best_val_loss"])
+                logger.info("Resumed from %s at epoch %d (best val %s=%.5f)",
+                            resume_path, start_epoch, selection_metric, best_val_score)
+            else:
+                logger.warning(
+                    "Resumed from %s at epoch %d, but it was selected on val %s while this run "
+                    "selects on val %s -- resetting the running best (was %.5f).",
+                    resume_path, start_epoch, ckpt_metric, selection_metric,
+                    ckpt.get("best_val_score", ckpt["best_val_loss"]),
+                )
 
     weights = {
         "ms": t.get("ms_weight", 0.0),
@@ -541,15 +621,23 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
         max_samples=fb_cfg.get("sigma_max_samples", 2000),
         force_recompute=fb_cfg.get("force_recompute_sigma_band", False),
     )
+    fb_band_weight = fb_cfg.get("band_weight")
+    fb_pixel_weight_enabled = fb_cfg.get("pixel_weight_enabled")
     freq_loss_fn = FreqBandLoss(
         sigma_band=fb_sigma_band, n_levels=fb_n_levels, base_sigma=fb_base_sigma,
         cdf_weight_mode=fb_cfg.get("cdf_weight_mode", "down_extremes"),
         sigma_floor=fb_cfg.get("sigma_floor", 1e-3),
+        band_weight=tuple(fb_band_weight) if fb_band_weight is not None else None,
+        pixel_weight_enabled=tuple(fb_pixel_weight_enabled) if fb_pixel_weight_enabled is not None else None,
     )
     logger.info(
         "freq_band_loss built (active during training: %s): n_levels=%d, base_sigma=%.2f, "
-        "cdf_weight_mode=%s, sigma_band=%s",
-        weights["freq"] > 0, fb_n_levels, fb_base_sigma, freq_loss_fn.cdf_weight_mode, fb_sigma_band.tolist(),
+        "cdf_weight_mode=%s, band_weight(coarse->fine)=%s, pixel_weight_enabled(coarse->fine)=%s, "
+        "sigma_band=%s",
+        weights["freq"] > 0, fb_n_levels, fb_base_sigma, freq_loss_fn.cdf_weight_mode,
+        fb_band_weight if fb_band_weight is not None else [1.0] * fb_n_levels,
+        fb_pixel_weight_enabled if fb_pixel_weight_enabled is not None else [True] * fb_n_levels,
+        fb_sigma_band.tolist(),
     )
 
     grad_clip_norm = t.get("grad_clip_norm", 1.0)
@@ -558,6 +646,7 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
     early_stop_patience = t.get("early_stop_patience", 8)
     logger.info("Early stop patience: %s val check(s) without improvement%s",
                 early_stop_patience, "" if early_stop_patience > 0 else " (disabled)")
+    logger.info("Checkpoint selection / early stopping metric: val %s", selection_metric)
 
     global_step = 0
     epochs_since_improvement = 0
@@ -607,13 +696,14 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
             # purely as a diagnostic -- see compute_weighted_loss.
             val_metrics = evaluate(model, val_loader, terrain_raw, device, weights, mean_aux,
                                    ms_loss_fn, freq_loss_fn, extreme_cfg)
-            val_loss = val_metrics["total"]
+            val_score = val_metrics[selection_metric]
             logger.info(
                 "Epoch %d | Val Loss %.5f (Pin %.5f [q90 %.5f, q10 %.5f], MS %.5f, Freq %.5f, "
-                "L1 %.5f, Spectral %.5f, Gradient %.5f)",
-                epoch, val_loss, val_metrics["pin"], val_metrics["pin90"], val_metrics["pin10"],
-                val_metrics["ms"], val_metrics["freq"],
+                "L1 %.5f, Spectral %.5f, Gradient %.5f) | CRPS %.5f",
+                epoch, val_metrics["total"], val_metrics["pin"], val_metrics["pin90"],
+                val_metrics["pin10"], val_metrics["ms"], val_metrics["freq"],
                 val_metrics["l1"], val_metrics["spectral"], val_metrics["gradient"],
+                val_metrics["crps"],
             )
             logger.info(
                 "Epoch %d | Coverage q10/q50/q90 = %.3f/%.3f/%.3f (nominal .10/.50/.90) | "
@@ -622,17 +712,20 @@ def train(config: dict, device_str: str, resume_path: Path | None = None,
                 val_metrics["cov_q10_ext"], val_metrics["cov_q50_ext"], val_metrics["cov_q90_ext"],
             )
 
-            save_checkpoint(checkpoint_dir / "last.pth", model, optimizer, scheduler, epoch, best_val_loss)
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            save_checkpoint(checkpoint_dir / "last.pth", model, optimizer, scheduler, epoch,
+                            best_val_score, selection_metric)
+            if val_score < best_val_score:
+                best_val_score = val_score
                 epochs_since_improvement = 0
-                save_checkpoint(checkpoint_dir / "best.pth", model, optimizer, scheduler, epoch, best_val_loss)
-                logger.info("New best val loss: %.5f (saved checkpoints/best.pth)", best_val_loss)
+                save_checkpoint(checkpoint_dir / "best.pth", model, optimizer, scheduler, epoch,
+                                best_val_score, selection_metric)
+                logger.info("New best val %s: %.5f (saved checkpoints/best.pth)",
+                            selection_metric, best_val_score)
             else:
                 epochs_since_improvement += 1
-                logger.info("Epoch %d | Val loss did not improve (%d/%s val checks since best=%.5f)",
-                            epoch, epochs_since_improvement,
-                            early_stop_patience if early_stop_patience > 0 else "inf", best_val_loss)
+                logger.info("Epoch %d | Val %s did not improve (%d/%s val checks since best=%.5f)",
+                            epoch, selection_metric, epochs_since_improvement,
+                            early_stop_patience if early_stop_patience > 0 else "inf", best_val_score)
                 if early_stop_patience > 0 and epochs_since_improvement >= early_stop_patience:
                     logger.info(
                         "Epoch %d | Early stopping: no improvement for %d val check(s) (patience=%d).",

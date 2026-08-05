@@ -18,7 +18,7 @@ Output:
 
 sigma_mean vs sigma_spread: the ERA5 observation-noise sigma is decoupled between the posterior
 MEAN and the posterior SPREAD, each conditioned in its own enscgp() pass over the same prior/
-observation (see tune_enscgp_sigma.py / sigma_mae_sweep.py / sigma_decouple_check.py for how
+observation (see tune_sigma.py, modes `ssr` / `mae` / `decouple`, for how
 these were chosen). A single sigma can't do both well: sigma~2.77 (the literal empirical
 ERA5-vs-WRF representativeness error) gives the best posterior MEAN accuracy (MAE) but a
 drastically overconfident posterior SPREAD (bulk+extreme SSR ~0.13); sigma~92 fixes the SPREAD's
@@ -33,6 +33,7 @@ Usage:
     python enscgp_train.py --all --sigma_mean 10 --sigma_spread 92.34 [--output data/enscgp_posterior.npy]
 """
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -40,7 +41,15 @@ import scipy.sparse as sp
 from scipy.linalg import solve
 
 from coarsening_operator import load_coarsening_operator
-from variance_recalibration import StratifiedRecalibrationMaps, apply_fortin_to_cholesky, recalibrate_cholesky
+from paths import DATA_DIR, EXTRA_SCRIPTS_DIR
+
+# variance_recalibration is a calibration/data-prep tool, so it lives under
+# extra_scripts/enscgp/ rather than here; make it importable regardless of cwd.
+sys.path.insert(0, str(EXTRA_SCRIPTS_DIR / "enscgp"))
+
+from variance_recalibration import (  # noqa: E402
+    StratifiedRecalibrationMaps, apply_fortin_to_cholesky, recalibrate_cholesky,
+)
 
 
 def load_neighbors(neighbors_path: Path) -> np.ndarray:
@@ -221,7 +230,7 @@ def compute_index(
     return posterior_to_output(mean_post, A_post, recalibration_maps=recalibration_maps)
 
 def main() -> None:
-    data_dir = Path(__file__).resolve().parent.parent / "data"
+    data_dir = DATA_DIR
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--wrf_path", type=Path, default=data_dir / "wrf_uv.npy")
     parser.add_argument("--neighbors_path", type=Path, default=data_dir / "neighbor_train_only.npy")

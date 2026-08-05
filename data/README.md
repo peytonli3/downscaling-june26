@@ -11,17 +11,22 @@ rebuild the derived ones.
 ## Raw / stable inputs
 Sourced externally or built once; not tied to a model version.
 
-| File | What it is |
-|------|------------|
-| `wrf_uv.npy` | WRF high-res u/v truth |
-| `era5_uv_2ch_native34.npy` | ERA5 u/v on its native 34-cell grid |
-| `era5_uv_2ch_bicubic.npy` | ERA5 u/v bicubically upsampled to the WRF grid (preprocessing product; stable) |
-| `topography_features.npy` | Terrain features (encoder input) |
-| `land_sea_mask_features.npy`, `land_mask_hires.npz` | Land/sea masks |
-| `neighbors.npy`, `neighbor_train_only.npy` | Nearest-neighbor indices (train-only variant excludes val/test) |
-| `event_splits.csv`, `sample_event_ids.csv` | Event IDs / metadata |
-| `splits_70_15_15/` | Train/val/test index splits (`split_indices.npz` + per-set arrays) |
-| `coarsening_operator_H.npy` | Coarsening operator H (built by `scripts/coarsening_operator.py`; stable) |
+Everything here derives from the upstream `wndata.mat` (plus a Copernicus DEM clip
+for terrain) — see `WIND_MAT_PATH` / `WIND_DEM_TIF` in `scripts/paths.py`.
+Builders live in `extra_scripts/data_prep/`.
+
+| File | What it is | Built by |
+|------|------------|----------|
+| `wrf_uv.npy` | WRF high-res u/v truth | upstream `wndata.mat` |
+| `era5_uv_2ch_native34.npy` | ERA5 u/v on its native 34-cell grid | `data_prep/extract_era5_native34.py` |
+| `era5_uv_2ch_bicubic.npy` | ERA5 u/v bicubically upsampled to the WRF grid | preprocessing product; stable |
+| `topography_features.npy` | Terrain features (encoder input) | `data_prep/build_hires_features.py` |
+| `land_sea_mask_features.npy` | Land/sea mask features | `data_prep/build_hires_features.py` |
+| `land_mask_hires.npz` | Sharp coastline mask (`wrf` 200×200, `era34` 34×34) | `data_prep/build_hires_land_mask.py` |
+| `neighbors.npy`, `neighbor_train_only.npy` | Nearest-neighbor indices (train-only variant excludes val/test) | `data_prep/nearest_neighbors.py` |
+| `event_splits.csv`, `sample_event_ids.csv` | Event IDs / metadata | `data_prep/split_temporal_dataset.py` |
+| `splits_70_15_15/` | Train/val/test index splits (`split_indices.npz` + per-set arrays) | `data_prep/split_temporal_dataset.py` |
+| `coarsening_operator_H.npy` | HR→LR coarsening operator H | `scripts/coarsening_operator.py` |
 
 ## Derived / regenerable (per-version)
 Regenerated as the pipeline changes; safe to delete and rebuild.
@@ -41,6 +46,7 @@ caches on first use).
 `precompute_prior_spread.py` for the `variance_conditioning` model path, removed at 0714
 (no longer a constructor option) — the two scripts that produced/consumed them
 (`precompute_prior_spread.py`, `train_finetune_variance.py`) and their diagnostic
-(`extra_scripts/graphing/verify_variance_conditioning.py`) were dead code and are removed
-as of 0729 (code recoverable via git tag `archive/variance-conditioning`). The two data
-files were moved to `_archive/` on disk rather than deleted.
+(`extra_scripts/graphing/verify_variance_conditioning.py`, in the pre-reorg tree) were dead
+code and are removed as of 0729 (code recoverable via git tag
+`archive/variance-conditioning`). The two data files were moved out of the repo to
+`../26.6_wind_archive/` rather than deleted.

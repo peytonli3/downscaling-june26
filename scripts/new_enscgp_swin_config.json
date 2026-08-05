@@ -1,9 +1,10 @@
 {
   "seed": 0,
   "paths": {
-    "data_dir": "/home/peytonli/26.6_wind/data",
-    "log_dir": "/home/peytonli/26.6_wind/runs/0729_meangate",
-    "splits_path": "/home/peytonli/26.6_wind/data/splits_70_15_15/split_indices.npz"
+    "COMMENT": "Repo-relative, resolved against the repo root by paths.resolve(); an absolute path here still wins.",
+    "data_dir": "data",
+    "log_dir": "runs/0729_meangate",
+    "splits_path": "data/splits_70_15_15/split_indices.npz"
   },
   "model": {
     "img_size": 200,
@@ -17,30 +18,31 @@
     "offset_spread_init": 3.0,
     "drop_rate": 0.05,
     "attn_drop_rate": 0.05,
-    "drop_path_rate": 0.1,
+    "drop_path_rate": 0.2,
     "head_dropout": 0.15
   },
   "training": {
     "batch_size": 8,
     "num_epochs": 100,
-    "learning_rate": 0.00001,
-    "weight_decay": 0.0001,
+    "learning_rate": 0.000001,
+    "weight_decay": 0.0005,
     "pin_weight": 1.0,
     "ms_weight": 1.0,
-    "freq_weight": 0.5,
+    "freq_weight": 0.3,
     "l1_weight": 0.0,
     "spectral_weight": 0.0,
     "gradient_weight": 0.0,
     "spectral_low_freq_cutoff": 0.28,
     "extreme_weight": {
       "enabled": true,
-      "alpha": 2.0,
+      "alpha": 5.0,
       "apply_to_q10": true
     },
     "multiscale": {
       "n_levels": 5,
       "base_sigma": 2,
-      "metric_per_band": ["l1", "sw", "sw", "sw", "sw"],
+      "COMMENT": "bands are from coarsest to finest",
+      "metric_per_band": ["sw", "sw", "sw", "sw", "sw"],
       "patch_size": 8,
       "patch_stride": 4,
       "n_projections": 64,
@@ -53,6 +55,8 @@
       "n_levels": 5,
       "base_sigma": 2,
       "cdf_weight_mode": "down_extremes",
+      "band_weight": [1, 1, 1, 0.5, 0.2],
+      "pixel_weight_enabled": [true, true, false, true, false],
       "sigma_floor": 0.001,
       "sigma_max_samples": 2000,
       "force_recompute_sigma_band": false
@@ -60,6 +64,7 @@
     "grad_clip_norm": 1.0,
     "num_workers": 2,
     "val_interval": 1,
+    "selection_metric": "crps",
     "early_stop_patience": 50,
     "lr_milestone_fractions": [0.25, 0.4, 0.6, 0.8],
     "lr_gamma": 0.5

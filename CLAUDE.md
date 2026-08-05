@@ -46,10 +46,17 @@ python train_new_enscgp_swin.py [--config new_enscgp_swin_config.json] [--device
   meaning (see conv_first note below).
 
 ### Evaluate / diagnose a checkpoint
-Under `extra_scripts/graphing/swin/`: `eval_new_enscgp_swin_checkpoint.py`
-(panel figures), `eval_quantile_calibration.py` (PIT histogram + coverage
-maps), `compare_eigenspectra_enscgp_swin.py` (spectral fidelity of q50).
-Point `--checkpoint` at `runs/<version>/checkpoints/*.pth`.
+Under `extra_scripts/swin/`: `eval_checkpoint.py` (panel figures),
+`eval_quantile_calibration.py` (PIT histogram + coverage maps),
+`compare_eigenspectra.py` (spectral fidelity of q50), `eval_pinball_impact.py`.
+Point `--checkpoint` at `runs/<version>/checkpoints/*.pth`; they all share
+`swin/_common.py`, so a new diagnostic should start from that harness rather
+than re-deriving the config/checkpoint/array loading.
+
+Multi-mode tools take a subcommand rather than existing as separate scripts:
+`enscgp/neighbor_mae.py {rank,mean,sweep-k,baseline}`,
+`enscgp/tune_sigma.py {ssr,mae,decouple}`,
+`swin/oneoff/bias_diagnostic.py --part {a,b,c,d,a_meangate,all}`.
 
 ### Versioning
 A checkpoint-incompatible architecture change = a new git tag:
@@ -105,17 +112,28 @@ always computed on validation as a diagnostic (`compute_all` in
 - `scripts/` -- the live model/training pipeline, flat (modules import each
   other by bare name, e.g. `from new_enscgp_swin import ...`) -- do not nest
   this into packages.
-- `extra_scripts/` -- eval/diagnostics/plotting, organized by function
-  (`enscgp/`, `graphing/`, `ken_enscgp/`); many hardcode absolute
-  `sys.path` insertions like `/home/peytonli/26.6_wind/scripts` -- check a
-  script's own header before relocating anything under `extra_scripts/`.
+- `scripts/paths.py` -- the ONLY place that knows where anything lives. No file
+  in this repo may hardcode an absolute path; add a constant here instead.
+  Config values go through `paths.resolve()` (absolute wins, relative is
+  repo-relative). `python scripts/paths.py` prints and checks every path.
+- `extra_scripts/` -- organized by pipeline stage, then by role:
+  `data_prep/`, `enscgp/{,graphing/}`, `swin/{,graphing/,oneoff/}`,
+  `presentation/`, `vendor/`. The recurring evals sit at `swin/` top level;
+  `swin/oneoff/` holds one-time investigations kept for provenance.
+- Modules starting with `_` are shared helpers, never entry points:
+  `swin/_common.py` (eval harness), `enscgp/_common.py` (neighbor loaders),
+  `swin/oneoff/_v6_common.py` (pins the v6-0714 class for the 0714 diagnostics).
+- Scripts outside `scripts/` bootstrap by walking UP to find the repo (see
+  `paths.py`'s docstring). Never replace that with a fixed `.parent` count --
+  that is exactly what broke the last time files were moved.
 - `data/` -- gitignored; raw-vs-derived classification and regeneration
   commands are in `data/README.md`.
-- `runs/<version>/` -- training logs + checkpoints per version, going
-  forward (older versions used the now-retired `logs/` + `inference_results/`
-  split).
-- `_archive/` -- gitignored on-disk graveyard for retired binaries; the
-  corresponding code is recoverable via `archive/*` git tags, not deleted.
+- `runs/<version>/` -- everything one run produced: `train_*.log` (tracked),
+  `checkpoints/` and `figures/` (gitignored, except figures' `*.csv`). This is
+  the ONLY per-version output location; the old `logs/` + `inference_results/`
+  split is gone.
+- `../26.6_wind_archive/` -- OUTSIDE the repo, the on-disk graveyard for retired
+  binaries; the corresponding code is recoverable via `archive/*` git tags.
 
 ### Known sharp edges
 - `conv_first`'s weight SHAPE has stayed constant across several architecture
