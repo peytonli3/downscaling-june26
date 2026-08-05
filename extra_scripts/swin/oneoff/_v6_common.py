@@ -83,23 +83,14 @@ CONFIG = {
     },
 }
 
-# 3-quantile CRPS decomposition (see eval_checkpoint.py docstring for the
-# midpoint-rule derivation of these weights); duplicated here rather than imported to avoid a
-# fragile cross-module sys.path / module-cache interaction with the OLD architecture import.
-CRPS_TAUS = (0.1, 0.5, 0.9)
-CRPS_WEIGHTS = (0.3, 0.4, 0.3)
-
-
-def pinball(q: np.ndarray, truth: np.ndarray, tau: float) -> np.ndarray:
-    err = truth - q
-    return np.maximum(tau * err, (tau - 1.0) * err)
-
-
-def crps_3q_approx(q10: np.ndarray, q50: np.ndarray, q90: np.ndarray, truth: np.ndarray) -> np.ndarray:
-    total = np.zeros_like(truth, dtype=np.float64)
-    for tau, w, q in zip(CRPS_TAUS, CRPS_WEIGHTS, (q10, q50, q90)):
-        total += w * pinball(q, truth, tau)
-    return 2.0 * total
+# 3-quantile CRPS decomposition, re-exported from scripts/quantile_metrics.py so these
+# diagnostics score the 0714 checkpoint with the same functional the run itself optimized.
+# Safe to import despite the pinned-OLD-architecture juggling above: quantile_metrics
+# imports nothing from this repo (only numpy/torch), so it cannot drag the CURRENT model
+# class in behind it -- which is the specific hazard the sys.path ordering guards against.
+from quantile_metrics import (  # noqa: E402  (re-exported)
+    CRPS_TAUS, CRPS_WEIGHTS, crps_3q, pinball,
+)
 
 
 def load_model(device):
@@ -161,84 +152,96 @@ def bh_fdr_mask(pvals: np.ndarray, q: float = 0.05) -> np.ndarray:
     return (flat <= cutoff).reshape(shape)
 
 
-@torch.no_grad()
-def compute_event_bias(model, device, terrain_raw, split_map, split: str, batch_size: int = 16,
-                        max_events: int | None = None, seed: int = 0):
-    """Per-event mean signed q50 bias (pred - truth), per component.
+def select_event_ids(split_map, split: str, max_events: int | None = None, seed: int = 0) -> np.ndarray:
+    """Sorted event ids for `split`, optionally subsampled to `max_events`."""
+    event_ids = np.array(sorted(split_map[split].keys()))
+    if max_events is not None and max_events < len(event_ids):
+        rng = np.random.default_rng(seed)
+        event_ids = np.sort(rng.choice(event_ids, size=max_events, replace=False))
+    return event_ids
 
-    Returns (event_ids: (E,) int, event_bias: (E,2,H,W) float64). Averaging within an event
-    BEFORE any across-event statistic is the point: it collapses each event's (correlated,
-    near-duplicate) samples into one independent unit.
+
+@torch.no_grad()
+def iter_event_batches(model, device, terrain_raw, split_map, split: str, batch_size: int = 16,
+                       max_events: int | None = None, seed: int = 0):
+    """Run `model` over a split, event by event, yielding (ei, event_id, pred, truth).
+
+    `ei` is the event's position in `select_event_ids(...)` (so a caller can write straight
+    into a preallocated (E, ...) array), `pred` is the model's raw output and `truth` the
+    matching WRF batch, both torch float32 on `device`. One event may span several yields;
+    the yields for an event are contiguous.
+
+    The raw output is handed back UNSLICED on purpose -- the v6 and v7 architectures put the
+    quantiles in different channels, and the two callers of this generator load different
+    ones (see eval_model_scorecard.py), so slicing is the caller's business.
+
+    This is the one place the "load three mmaps, walk a split's events in index order,
+    forward in batches" loop lives; compute_event_bias, compute_event_predictions, and
+    eval_model_scorecard's event_metrics all used to carry their own copy of it.
     """
     posterior = np.load(DATA_DIR / "enscgp_posterior.npy", mmap_mode="r")
     bicubic = np.load(DATA_DIR / "era5_uv_2ch_bicubic.npy", mmap_mode="r")
     wrf = np.load(DATA_DIR / "wrf_uv.npy", mmap_mode="r")
 
     events = split_map[split]
-    event_ids = np.array(sorted(events.keys()))
-    if max_events is not None and max_events < len(event_ids):
-        rng = np.random.default_rng(seed)
-        event_ids = np.sort(rng.choice(event_ids, size=max_events, replace=False))
-
-    H = W = 200
-    event_bias = np.zeros((len(event_ids), 2, H, W), dtype=np.float64)
-
-    for ei, eid in enumerate(event_ids):
+    for ei, eid in enumerate(select_event_ids(split_map, split, max_events, seed)):
         idx = np.array(sorted(events[int(eid)]))
-        chunks = []
         for s in range(0, len(idx), batch_size):
             b = idx[s:s + batch_size]
             post_b = torch.from_numpy(np.array(posterior[b], dtype=np.float32, copy=True)).to(device)
             bic_b = torch.from_numpy(np.array(bicubic[b], dtype=np.float32, copy=True)).to(device)
-            pred = model(post_b, bic_b, terrain_raw).cpu().numpy()
-            q50 = pred[:, ProbabilisticSwin2SR.Q50_SLICE].astype(np.float64)
-            truth = np.array(wrf[b], dtype=np.float64, copy=True)
-            chunks.append(q50 - truth)
-        event_bias[ei] = np.concatenate(chunks, axis=0).mean(axis=0)
-
-    return event_ids, event_bias
+            truth_b = torch.from_numpy(np.array(wrf[b], dtype=np.float32, copy=True)).to(device)
+            yield ei, int(eid), model(post_b, bic_b, terrain_raw), truth_b
 
 
-@torch.no_grad()
+def _per_event_mean(model, device, terrain_raw, split_map, split: str, slices, batch_size: int,
+                    max_events: int | None, seed: int):
+    """Mean over each event's samples of `slices` applied to the prediction, plus the truth.
+
+    Returns (event_ids (E,), [ (E,2,H,W) float64 per slice ], truth (E,2,H,W) float64).
+    Averaging WITHIN an event before any across-event statistic is the load-bearing part:
+    it collapses each event's correlated, near-duplicate samples into one independent unit
+    (see the module docstring).
+    """
+    event_ids = select_event_ids(split_map, split, max_events, seed)
+    E, H, W = len(event_ids), 200, 200
+    sums = [np.zeros((E, 2, H, W), dtype=np.float64) for _ in slices]
+    truth_sum = np.zeros((E, 2, H, W), dtype=np.float64)
+    counts = np.zeros(E, dtype=np.float64)
+
+    for ei, _eid, pred, truth in iter_event_batches(model, device, terrain_raw, split_map, split,
+                                                    batch_size, max_events, seed):
+        pred_np = pred.cpu().numpy()
+        for acc, sl in zip(sums, slices):
+            acc[ei] += pred_np[:, sl].astype(np.float64).sum(axis=0)
+        truth_sum[ei] += truth.cpu().numpy().astype(np.float64).sum(axis=0)
+        counts[ei] += pred_np.shape[0]
+
+    n = counts.reshape(-1, 1, 1, 1)
+    return event_ids, [acc / n for acc in sums], truth_sum / n
+
+
+def compute_event_bias(model, device, terrain_raw, split_map, split: str, batch_size: int = 16,
+                        max_events: int | None = None, seed: int = 0):
+    """Per-event mean signed q50 bias (pred - truth), per component.
+
+    Returns (event_ids: (E,) int, event_bias: (E,2,H,W) float64).
+    """
+    event_ids, (q50,), truth = _per_event_mean(
+        model, device, terrain_raw, split_map, split,
+        (ProbabilisticSwin2SR.Q50_SLICE,), batch_size, max_events, seed)
+    return event_ids, q50 - truth
+
+
 def compute_event_predictions(model, device, terrain_raw, split_map, split: str, batch_size: int = 16,
                                max_events: int | None = None, seed: int = 0):
     """Like compute_event_bias, but returns per-event-averaged q10/q50/q90 AND truth (each
     (E,2,H,W)) rather than just the bias -- needed by Part B for coverage/CRPS after correction,
     which need the full quantile triple, not only q50's bias."""
-    posterior = np.load(DATA_DIR / "enscgp_posterior.npy", mmap_mode="r")
-    bicubic = np.load(DATA_DIR / "era5_uv_2ch_bicubic.npy", mmap_mode="r")
-    wrf = np.load(DATA_DIR / "wrf_uv.npy", mmap_mode="r")
-
-    events = split_map[split]
-    event_ids = np.array(sorted(events.keys()))
-    if max_events is not None and max_events < len(event_ids):
-        rng = np.random.default_rng(seed)
-        event_ids = np.sort(rng.choice(event_ids, size=max_events, replace=False))
-
-    H = W = 200
-    E = len(event_ids)
-    q10 = np.zeros((E, 2, H, W), dtype=np.float64)
-    q50 = np.zeros((E, 2, H, W), dtype=np.float64)
-    q90 = np.zeros((E, 2, H, W), dtype=np.float64)
-    truth = np.zeros((E, 2, H, W), dtype=np.float64)
-
-    for ei, eid in enumerate(event_ids):
-        idx = np.array(sorted(events[int(eid)]))
-        q10c, q50c, q90c, tc = [], [], [], []
-        for s in range(0, len(idx), batch_size):
-            b = idx[s:s + batch_size]
-            post_b = torch.from_numpy(np.array(posterior[b], dtype=np.float32, copy=True)).to(device)
-            bic_b = torch.from_numpy(np.array(bicubic[b], dtype=np.float32, copy=True)).to(device)
-            pred = model(post_b, bic_b, terrain_raw).cpu().numpy()
-            q10c.append(pred[:, ProbabilisticSwin2SR.Q10_SLICE].astype(np.float64))
-            q50c.append(pred[:, ProbabilisticSwin2SR.Q50_SLICE].astype(np.float64))
-            q90c.append(pred[:, ProbabilisticSwin2SR.Q90_SLICE].astype(np.float64))
-            tc.append(np.array(wrf[b], dtype=np.float64, copy=True))
-        q10[ei] = np.concatenate(q10c, axis=0).mean(axis=0)
-        q50[ei] = np.concatenate(q50c, axis=0).mean(axis=0)
-        q90[ei] = np.concatenate(q90c, axis=0).mean(axis=0)
-        truth[ei] = np.concatenate(tc, axis=0).mean(axis=0)
-
+    event_ids, (q10, q50, q90), truth = _per_event_mean(
+        model, device, terrain_raw, split_map, split,
+        (ProbabilisticSwin2SR.Q10_SLICE, ProbabilisticSwin2SR.Q50_SLICE,
+         ProbabilisticSwin2SR.Q90_SLICE), batch_size, max_events, seed)
     return event_ids, q10, q50, q90, truth
 
 

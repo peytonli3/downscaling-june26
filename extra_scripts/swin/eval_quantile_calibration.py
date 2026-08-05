@@ -45,19 +45,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 from matplotlib.colors import TwoSlopeNorm
 
-
 from _common import (  # noqa: E402  (shared harness; also puts scripts/ on sys.path)
-    COMPONENTS, DEFAULT_CONFIG_PATH, ProbabilisticSwin2SR, build_model,
-    choose_indices_all as choose_indices, load_config, load_terrain_input,
-    resolve_path,
+    COMPONENTS, ProbabilisticSwin2SR, add_eval_args,
+    choose_indices_all as choose_indices, iter_predictions, setup, split_pool,
 )
 
 QUANTILES = (("q10", 0.10, ProbabilisticSwin2SR.Q10_SLICE),
@@ -163,88 +159,45 @@ def plot_coverage_maps(cov_maps: np.ndarray, lsm: np.ndarray | None, spread: flo
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--checkpoint", type=Path, default=None, help="Defaults to <log_dir>/checkpoints/best.pth")
-    parser.add_argument("--data_dir", type=Path, default=None)
-    parser.add_argument("--splits_path", type=Path, default=None)
-    parser.add_argument("--wrf_path", type=Path, default=None)
-    parser.add_argument("--posterior_path", type=Path, default=None)
-    parser.add_argument("--bicubic_path", type=Path, default=None)
-    parser.add_argument("--hires_land_mask_path", type=Path, default=None)
-    parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
-    parser.add_argument("--max_samples", type=int, default=None, help="Cap the split size (random subset) for a quick look")
-    parser.add_argument("--sample_indices", type=str, default=None, help="Raw indices; overrides --split/--max_samples")
-    parser.add_argument("--seed", type=int, default=42)
+    parser = add_eval_args(
+        argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter),
+        samples="all",
+    )
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--ext_quantile", type=float, default=0.9, help="Wind-magnitude percentile defining the 'extreme tail'")
     parser.add_argument("--cov_spread", type=float, default=0.15, help="+/- range of the coverage-deviation color scale")
     parser.add_argument("--pit_output", type=Path, default=None, help="Defaults to <log_dir>/figures/quantile_pit_histogram.png")
     parser.add_argument("--cov_output", type=Path, default=None, help="Defaults to <log_dir>/figures/quantile_coverage_maps.png")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    paths = config["paths"]
-    log_dir = resolve_path(paths["log_dir"])
-    data_dir = args.data_dir or resolve_path(paths["data_dir"])
-    checkpoint_path = args.checkpoint or (log_dir / "checkpoints" / "best.pth")
-    splits_path = args.splits_path or resolve_path(paths["splits_path"])
-    wrf_path = args.wrf_path or (data_dir / "wrf_uv.npy")
-    posterior_path = args.posterior_path or (data_dir / "enscgp_posterior.npy")
-    bicubic_path = args.bicubic_path or (data_dir / "era5_uv_2ch_bicubic.npy")
-    hires_land_mask_path = args.hires_land_mask_path or (data_dir / "land_mask_hires.npz")
-    pit_output = args.pit_output or (log_dir / "figures" / "quantile_pit_histogram.png")
-    cov_output = args.cov_output or (log_dir / "figures" / "quantile_coverage_maps.png")
+    ev = setup(args)
+    wrf = ev.arrays.wrf
+    pit_output = args.pit_output or ev.figure_path("quantile_pit_histogram.png")
+    cov_output = args.cov_output or ev.figure_path("quantile_coverage_maps.png")
 
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    device = torch.device(args.device)
-    model = build_model(config).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    terrain_raw = load_terrain_input(data_dir).unsqueeze(0).to(device)
-
-    wrf = np.load(wrf_path, mmap_mode="r")
-    posterior = np.load(posterior_path, mmap_mode="r")
-    bicubic = np.load(bicubic_path, mmap_mode="r")
-    n_total = min(wrf.shape[0], posterior.shape[0], bicubic.shape[0])
-
-    splits = np.load(splits_path)
-    pool = splits[f"{args.split}_idx"]
-    idx = choose_indices(pool, n_total, args.max_samples, args.seed, args.sample_indices)
+    idx = choose_indices(split_pool(ev.splits_path, args.split), ev.arrays.n_total,
+                         args.max_samples, args.seed, args.sample_indices)
 
     H, W = wrf.shape[2], wrf.shape[3]
     acc = CalibrationAccumulator(H, W)
-    print(f"Evaluating {len(idx)} samples from split '{args.split}' on {device} "
+    print(f"Evaluating {len(idx)} samples from split '{args.split}' on {ev.device} "
           f"(batch_size={args.batch_size})...")
-    for start in range(0, len(idx), args.batch_size):
-        batch_idx = idx[start:start + args.batch_size]
-        post_b = torch.from_numpy(np.array(posterior[batch_idx], dtype=np.float32, copy=True)).to(device)
-        bic_b = torch.from_numpy(np.array(bicubic[batch_idx], dtype=np.float32, copy=True)).to(device)
-        with torch.no_grad():
-            pred = model(post_b, bic_b, terrain_raw).cpu().numpy()
-        if pred.shape[1] != ProbabilisticSwin2SR.OUT_CHANNELS:
-            raise ValueError(
-                f"Expected a {ProbabilisticSwin2SR.OUT_CHANNELS}-channel quantile output, got "
-                f"{pred.shape[1]}. Is {checkpoint_path} a pre-0714 Gaussian/Cholesky checkpoint?"
-            )
+    # Streamed rather than materialized: the whole test split of 6-channel predictions is
+    # ~1 GB, and this diagnostic only ever needs running sums of it.
+    for batch_idx, pred in iter_predictions(ev, idx, batch_size=args.batch_size):
         wrf_b = np.array(wrf[batch_idx], dtype=np.float32, copy=True)
         acc.update(pred, wrf_b, args.ext_quantile)
 
     cov_maps = acc.coverage_maps()
     pit_overall, pit_ext = acc.pit_fractions()
 
-    hires_masks = np.load(hires_land_mask_path)
-    lsm_wrf = hires_masks["wrf"].astype(np.float64)
+    lsm_wrf = ev.arrays.wrf_land_mask()
 
     plot_pit(pit_overall, pit_ext, args.ext_quantile, pit_output)
     plot_coverage_maps(cov_maps, lsm_wrf, args.cov_spread, cov_output)
 
     # ── printed summary ──
-    print(f"\nCheckpoint: {checkpoint_path} (epoch {ckpt.get('epoch')}, best_val_loss {ckpt.get('best_val_loss')})")
+    print(f"\nCheckpoint: {ev.describe_checkpoint()}")
     print(f"Split: {args.split} | samples: {acc.n_samples}")
     print("\nMean coverage (nominal in parentheses):")
     for qi, (name, nominal, _sl) in enumerate(QUANTILES):

@@ -41,7 +41,7 @@ from scipy.stats import skew
 
 from _v6_common import (
     COMPONENTS, DATA_DIR, OUTPUT_DIR, RUNS_DIR, bh_fdr_mask, coastline_distance,
-    compute_event_bias, compute_event_predictions, crps_3q_approx, event_stats,
+    compute_event_bias, compute_event_predictions, crps_3q, event_stats,
     load_elevation_200, load_event_split_map, load_land_mask, load_model, load_terrain,
     pinball, plot_diverging,
 )
@@ -222,7 +222,7 @@ def run_part_a():
 #    split (more data) at the selected (sigma, lambda) and applied to test.
 # 3. Two variants: band-shift (shifts q10/q50/q90 together, monotonicity trivially preserved) and
 #    median-only (shifts only q50; a monotonicity-violation check is reported, not assumed away).
-# 4. Before/after test metrics (MAE, RMSE, crps_3q_approx, coverage at q10/50/90 aggregate + maps,
+# 4. Before/after test metrics (MAE, RMSE, crps_3q, coverage at q10/50/90 aggregate + maps,
 #    extreme-stratum coverage) with PAIRED event-level bootstrap CIs on the (after - before)
 #    difference.
 # 
@@ -297,7 +297,7 @@ def compute_metrics(q10, q50, q90, truth):
     err = q50 - truth
     mae = np.abs(err).mean(axis=(2, 3))
     rmse = np.sqrt((err ** 2).mean(axis=(2, 3)))
-    crps = crps_3q_approx(q10, q50, q90, truth).mean(axis=(2, 3))
+    crps = crps_3q(q10, q50, q90, truth).mean(axis=(2, 3))
     cov10 = (truth <= q10).mean(axis=(2, 3))
     cov50 = (truth <= q50).mean(axis=(2, 3))
     cov90 = (truth <= q90).mean(axis=(2, 3))

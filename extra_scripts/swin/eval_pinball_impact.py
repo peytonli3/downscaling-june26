@@ -53,25 +53,21 @@ import torch.nn.functional as F
 
 
 from _common import (  # noqa: E402  (shared harness; also puts scripts/ on sys.path)
-    DEFAULT_CONFIG_PATH, ProbabilisticSwin2SR, build_model, load_config, load_terrain_input,
-    resolve_path,
+    ProbabilisticSwin2SR, add_eval_args, build_model, choose_indices, setup, split_pool,
 )
 from train_new_enscgp_swin import MeanAuxLosses, compute_weighted_loss  # noqa: E402
 
 
-def load_batch(data_dir: Path, splits_path: Path, split: str, n_samples: int, seed: int, device):
-    posterior = np.load(data_dir / "enscgp_posterior.npy", mmap_mode="r")
-    bicubic = np.load(data_dir / "era5_uv_2ch_bicubic.npy", mmap_mode="r")
-    wrf = np.load(data_dir / "wrf_uv.npy", mmap_mode="r")
-    splits = np.load(splits_path)
-    pool = splits[f"{split}_idx"]
-    n = min(n_samples, len(pool))
-    idx = np.sort(np.random.default_rng(seed).choice(pool, size=n, replace=False))
+def load_batch(ev, idx: np.ndarray) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(posterior, bicubic, wrf) for `idx`, as one resident batch on ev.device.
 
-    post_t = torch.from_numpy(np.array(posterior[idx], dtype=np.float32, copy=True)).to(device)
-    bic_t = torch.from_numpy(np.array(bicubic[idx], dtype=np.float32, copy=True)).to(device)
-    wrf_t = torch.from_numpy(np.array(wrf[idx], dtype=np.float32, copy=True)).to(device)
-    return idx, post_t, bic_t, wrf_t
+    Unlike its sibling diagnostics this script does not use `_common.predict()`: it runs TWO
+    models (trained and fresh) over the same inputs, so what it needs is the inputs.
+    """
+    return tuple(
+        torch.from_numpy(np.array(arr[idx], dtype=np.float32, copy=True)).to(ev.device)
+        for arr in (ev.arrays.posterior, ev.arrays.bicubic, ev.arrays.wrf)
+    )
 
 
 @torch.no_grad()
@@ -111,35 +107,23 @@ def report_offset_stats(name: str, up: torch.Tensor, down: torch.Tensor):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--checkpoint", type=Path, required=True, help="Trained checkpoint to evaluate")
-    parser.add_argument("--data_dir", type=Path, default=None)
-    parser.add_argument("--splits_path", type=Path, default=None)
-    parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
-    parser.add_argument("--n_samples", type=int, default=256)
-    parser.add_argument("--seed", type=int, default=42, help="Sample-selection seed (independent of the model's training seed)")
+    parser = add_eval_args(
+        argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter),
+        n_samples_default=256, arrays=False,
+    )
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--output", type=Path, default=None, help="Asymmetry figure. Defaults to <checkpoint's log_dir>/figures/pinball_impact.png")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--output", type=Path, default=None, help="Asymmetry figure. Defaults to <log_dir>/figures/pinball_impact.png")
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    paths = config["paths"]
-    data_dir = args.data_dir or resolve_path(paths["data_dir"])
-    splits_path = args.splits_path or resolve_path(paths["splits_path"])
-    output = args.output or (resolve_path(paths["log_dir"]) / "figures" / "pinball_impact.png")
-    device = torch.device(args.device)
+    # setup() builds the TRAINED model (and resolves the config/paths/terrain/arrays).
+    ev = setup(args)
+    config, device, terrain_raw = ev.config, ev.device, ev.terrain_raw
+    trained = ev.model
+    output = args.output or ev.figure_path("pinball_impact.png")
 
-    print(f"Checkpoint: {args.checkpoint}")
+    print(f"Checkpoint: {ev.checkpoint}")
     print(f"Split: {args.split}, n_samples: {args.n_samples}\n")
-
-    # ── build the TRAINED model ──
-    trained = build_model(config).to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    trained.load_state_dict(ckpt["model_state_dict"])
-    trained.eval()
-    print(f"Trained checkpoint: epoch {ckpt.get('epoch')}, best_val_loss {ckpt.get('best_val_loss')}")
+    print(f"Trained checkpoint: epoch {ev.ckpt.get('epoch')}, best_val_loss {ev.ckpt.get('best_val_loss')}")
 
     # ── build a FRESH model reproducing this run's actual starting point (same seed) ──
     torch.manual_seed(config.get("seed", 0))
@@ -150,8 +134,9 @@ def main() -> None:
     print(f"offset_head parameters: {n_params_offset:,}\n")
 
     # ── real data ──
-    idx, posterior, bicubic, wrf = load_batch(data_dir, splits_path, args.split, args.n_samples, args.seed, device)
-    terrain_raw = load_terrain_input(data_dir).unsqueeze(0).to(device)
+    idx = choose_indices(split_pool(ev.splits_path, args.split), ev.arrays.n_total,
+                         args.n_samples, args.seed, args.sample_indices)
+    posterior, bicubic, wrf = load_batch(ev, idx)
 
     pred_trained = run_model(trained, posterior, bicubic, terrain_raw, args.batch_size)
     pred_fresh = run_model(fresh, posterior, bicubic, terrain_raw, args.batch_size)
@@ -238,7 +223,7 @@ def main() -> None:
     axes[1].set_title(f"Asymmetry vs wind magnitude (corr={corr:+.2f})")
     for ax in axes:
         ax.grid(True, alpha=0.3)
-    fig.suptitle(f"Pinball impact / asymmetry -- {args.checkpoint.name} (epoch {ckpt.get('epoch')})")
+    fig.suptitle(f"Pinball impact / asymmetry -- {ev.checkpoint.name} (epoch {ev.ckpt.get('epoch')})")
     plt.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(output), dpi=150, bbox_inches="tight")

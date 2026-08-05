@@ -63,9 +63,8 @@ for _d in (REPO / "scripts", REPO / "extra_scripts" / "swin",
 
 from paths import run_figures  # noqa: E402
 from _common import (  # noqa: E402  (shared harness; also puts scripts/ on sys.path)
-    DEFAULT_CONFIG_PATH, build_model, choose_indices, load_config, load_terrain_input,
-    plot_panel, sym_max,
-    resolve_path,
+    add_eval_args, choose_indices, plot_panel, predict, setup, split_pool, split_quantiles,
+    sym_max,
 )
 # Band decomposition + km scale labels, reused verbatim from the diagnostic so this plot
 # and band_error_diagnostics.py decompose the field identically.
@@ -75,21 +74,8 @@ COMPONENTS = ("u", "v")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="new_enscgp_swin_config.json (architecture + default paths)")
-    parser.add_argument("--checkpoint", type=Path, default=None, help="Defaults to <log_dir>/checkpoints/best.pth from --config")
-    parser.add_argument("--data_dir", type=Path, default=None, help="Defaults to paths.data_dir from --config")
-    parser.add_argument("--splits_path", type=Path, default=None, help="Defaults to paths.splits_path from --config")
-    parser.add_argument("--wrf_path", type=Path, default=None, help="Defaults to <data_dir>/wrf_uv.npy")
-    parser.add_argument("--posterior_path", type=Path, default=None, help="Defaults to <data_dir>/enscgp_posterior.npy")
-    parser.add_argument("--bicubic_path", type=Path, default=None, help="Defaults to <data_dir>/era5_uv_2ch_bicubic.npy")
-    parser.add_argument("--hires_land_mask_path", type=Path, default=None, help="Defaults to <data_dir>/land_mask_hires.npz")
-    parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"], help="Sample pool for default random selection")
-    parser.add_argument("--n_samples", type=int, default=4, help="Number of random samples to visualize")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
-    parser.add_argument(
-        "--sample_indices", type=str, default=None,
-        help="Comma-separated raw sample indices (overrides --split/--n_samples/--seed), e.g. 0,25,100",
+    parser = add_eval_args(
+        argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter),
     )
     parser.add_argument("--n_levels", type=int, default=5, help="Laplacian pyramid levels (bands)")
     parser.add_argument("--base_sigma", type=float, default=2.0,
@@ -97,46 +83,22 @@ def main() -> None:
     parser.add_argument("--output", type=Path,
                         default=run_figures("0629") / "swin_band_errors.png",
                         help="Output PNG path")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dpi", type=int, default=150)
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    paths = config["paths"]
-    data_dir = args.data_dir or resolve_path(paths["data_dir"])
-    checkpoint_path = args.checkpoint or (resolve_path(paths["log_dir"]) / "checkpoints" / "best.pth")
-    splits_path = args.splits_path or resolve_path(paths["splits_path"])
-    wrf_path = args.wrf_path or (data_dir / "wrf_uv.npy")
-    posterior_path = args.posterior_path or (data_dir / "enscgp_posterior.npy")
-    bicubic_path = args.bicubic_path or (data_dir / "era5_uv_2ch_bicubic.npy")
-    hires_land_mask_path = args.hires_land_mask_path or (data_dir / "land_mask_hires.npz")
+    ev = setup(args)
+    wrf = ev.arrays.wrf
 
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    idx = choose_indices(split_pool(ev.splits_path, args.split), ev.arrays.n_total,
+                         args.n_samples, args.seed, args.sample_indices)
 
-    device = torch.device(args.device)
-    model = build_model(config).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    terrain_raw = load_terrain_input(data_dir).unsqueeze(0).to(device)
+    lsm_wrf = ev.arrays.wrf_land_mask()
 
-    wrf = np.load(wrf_path, mmap_mode="r")
-    posterior = np.load(posterior_path, mmap_mode="r")
-    bicubic = np.load(bicubic_path, mmap_mode="r")
-    n_total = min(wrf.shape[0], posterior.shape[0], bicubic.shape[0])
-
-    splits = np.load(splits_path)
-    pool = splits[f"{args.split}_idx"]
-    idx = choose_indices(pool, n_total, args.n_samples, args.seed, args.sample_indices)
-
-    hires_masks = np.load(hires_land_mask_path)
-    lsm_wrf = hires_masks["wrf"].astype(np.float64)
-
-    posterior_batch = torch.from_numpy(np.array(posterior[idx], dtype=np.float32, copy=True)).to(device)
-    bicubic_batch = torch.from_numpy(np.array(bicubic[idx], dtype=np.float32, copy=True)).to(device)
-    with torch.no_grad():
-        pred_batch = model(posterior_batch, bicubic_batch, terrain_raw).cpu().numpy()  # (B, 5, 200, 200)
+    # q50 is the central field this plot is about ("SWIN mean" below). It MUST come out of
+    # split_quantiles: under the 0714+ quantile head channels 0-1 are q10, so the
+    # pre-0714 `pred[:, :2]` that used to sit here silently decomposed the LOWER ENVELOPE's
+    # error and labelled it the mean.
+    _q10, q50_batch, _q90 = split_quantiles(predict(ev, idx))  # q50: (B, 2, 200, 200)
 
     labels = scale_labels(args.n_levels, args.base_sigma)         # finest -> coarsest
     display_order = list(range(args.n_levels))[::-1]              # coarse (left) -> fine (right)
@@ -148,7 +110,7 @@ def main() -> None:
     max_recon_diff = 0.0
     for s, i in enumerate(idx):
         wrf_uv = np.asarray(wrf[i, :2], dtype=np.float64)      # (2, H, W)
-        pred_uv = pred_batch[s, :2].astype(np.float64)         # (2, H, W)
+        pred_uv = q50_batch[s].astype(np.float64)              # (2, H, W)
 
         err = pred_uv - wrf_uv                                          # (2, H, W), signed
         err_bands = laplacian_bands(err, args.n_levels, args.base_sigma)  # (n_levels, 2, H, W)
@@ -186,7 +148,7 @@ def main() -> None:
     assert max_recon_diff < 1e-3, f"Laplacian error bands do not sum to the error field (max abs diff {max_recon_diff})"
 
     fig.suptitle(
-        f"SWIN prediction error by frequency band, u/v separate (split={args.split}, ckpt={checkpoint_path.name}, "
+        f"SWIN prediction error by frequency band, u/v separate (split={args.split}, ckpt={ev.checkpoint.name}, "
         f"n_levels={args.n_levels}, base_sigma={args.base_sigma}px)",
         fontsize=13, y=1.0,
     )
@@ -197,7 +159,7 @@ def main() -> None:
     plt.close(fig)
 
     print(f"Saved figure: {args.output}")
-    print(f"Checkpoint: {checkpoint_path} (epoch {ckpt.get('epoch')}, best_val_loss {ckpt.get('best_val_loss')})")
+    print(f"Checkpoint: {ev.describe_checkpoint()}")
     print(f"Split: {args.split}; samples used: {idx.tolist()}")
     print(f"Band scale ranges (coarse -> fine, km): {[labels[b] for b in display_order]}")
     print(f"Error bands sum back to the error field (max abs diff {max_recon_diff:.2e}) OK")

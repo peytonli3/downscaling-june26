@@ -46,7 +46,7 @@ REPO = next(p for p in Path(__file__).resolve().parents
             if (p / "scripts" / "paths.py").is_file())
 sys.path.insert(0, str(REPO / "scripts"))
 
-from paths import resolve as resolve_path  # noqa: E402
+from paths import figures_dir, resolve as resolve_path  # noqa: E402
 
 from new_enscgp_swin import DEFAULT_CONFIG_PATH, load_config  # noqa: E402
 
@@ -390,7 +390,7 @@ def main() -> None:
         print(f"No log files found in {log_dir}. Use --logs to specify files explicitly.")
         sys.exit(1)
 
-    output = args.output or (log_dir / "figures" / "training_curves.png")
+    output = args.output or (figures_dir(log_dir) / "training_curves.png")
 
     print(f"Parsing {len(log_paths)} log file(s)...")
     logs = []

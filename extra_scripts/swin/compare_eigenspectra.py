@@ -15,8 +15,7 @@ the Gaussian/Cholesky head to quantiles unchanged in substance -- only which out
 carry the central field moved. The model now emits 6 channels
 [q10_u, q10_v, q50_u, q50_v, q90_u, q90_v]; the central field is the Q50 pair, which is the
 direct analog of the old predicted mean (it is literally still mean_head's output, and it is
-the field the structural losses train). NOTE: channels 0-1 are now q10, NOT the mean -- read
-the central field via ProbabilisticSwin2SR.Q50_SLICE, never by raw index 0/1.
+the field the structural losses train).
 
 The q10/q90 envelopes are deliberately NOT plotted: an uncertainty envelope is not a wind
 field, so its spectrum has no "should match WRF" target (the same category error the loss in
@@ -64,9 +63,7 @@ import torch
 
 
 from _common import (  # noqa: E402  (shared harness; also puts scripts/ on sys.path)
-    DEFAULT_CONFIG_PATH, ProbabilisticSwin2SR, build_model, choose_indices,
-    load_config, load_terrain_input,
-    resolve_path,
+    add_eval_args, choose_indices, predict, setup, split_pool, split_quantiles,
 )
 
 SOURCES = ("ERA5 bicubic", "EnsCGP posterior", "SWIN output (q50)", "WRF (truth)")
@@ -260,20 +257,9 @@ def plot_aggregate(idx: np.ndarray, k_km: np.ndarray, spectra: dict, band: str,
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--checkpoint", type=Path, default=None, help="Defaults to <log_dir>/checkpoints/best.pth from --config")
-    parser.add_argument("--data_dir", type=Path, default=None, help="Defaults to paths.data_dir from --config")
-    parser.add_argument("--splits_path", type=Path, default=None, help="Defaults to paths.splits_path from --config")
-    parser.add_argument("--wrf_path", type=Path, default=None, help="Defaults to <data_dir>/wrf_uv.npy")
-    parser.add_argument("--posterior_path", type=Path, default=None, help="Defaults to <data_dir>/enscgp_posterior.npy")
-    parser.add_argument("--bicubic_path", type=Path, default=None, help="Defaults to <data_dir>/era5_uv_2ch_bicubic.npy")
-    parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"], help="Sample pool for default random selection")
-    parser.add_argument("--n_samples", type=int, default=8, help="Number of samples to draw (also the aggregate sample size)")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--sample_indices", type=str, default=None,
-        help="Comma-separated raw sample indices (overrides --split/--n_samples/--seed), e.g. 0,25,100",
+    parser = add_eval_args(
+        argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter),
+        n_samples_default=8,
     )
     parser.add_argument("--dx_km", type=float, default=DX_KM, help="East-west grid spacing (km/pixel)")
     parser.add_argument("--dy_km", type=float, default=DY_KM, help="North-south grid spacing (km/pixel)")
@@ -285,59 +271,26 @@ def main() -> None:
                         help="Zoom x-axis to this wavelength range in km, e.g. --zoom_km 10 70")
     parser.add_argument("--output", type=Path, default=None,
                          help="Output PNG. Defaults to <log_dir>/figures/eigenspectra_aggregate_swin.png")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    paths = config["paths"]
-    log_dir = resolve_path(paths["log_dir"])
-    data_dir = args.data_dir or resolve_path(paths["data_dir"])
-    checkpoint_path = args.checkpoint or (log_dir / "checkpoints" / "best.pth")
-    splits_path = args.splits_path or resolve_path(paths["splits_path"])
-    wrf_path = args.wrf_path or (data_dir / "wrf_uv.npy")
-    posterior_path = args.posterior_path or (data_dir / "enscgp_posterior.npy")
-    bicubic_path = args.bicubic_path or (data_dir / "era5_uv_2ch_bicubic.npy")
-    output_path = args.output or (log_dir / "figures" / "eigenspectra_aggregate_swin.png")
+    ev = setup(args)
+    wrf, posterior, bicubic = ev.arrays.wrf, ev.arrays.posterior, ev.arrays.bicubic
+    output_path = args.output or ev.figure_path("eigenspectra_aggregate_swin.png")
 
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    idx = choose_indices(split_pool(ev.splits_path, args.split), ev.arrays.n_total,
+                         args.n_samples, args.seed, args.sample_indices)
 
-    device = torch.device(args.device)
-    model = build_model(config).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    terrain_raw = load_terrain_input(data_dir).unsqueeze(0).to(device)
-
-    wrf = np.load(wrf_path, mmap_mode="r")
-    posterior = np.load(posterior_path, mmap_mode="r")
-    bicubic = np.load(bicubic_path, mmap_mode="r")
-    n_total = min(wrf.shape[0], posterior.shape[0], bicubic.shape[0])
-
-    splits = np.load(splits_path)
-    pool = splits[f"{args.split}_idx"]
-    idx = choose_indices(pool, n_total, args.n_samples, args.seed, args.sample_indices)
-
-    posterior_batch = torch.from_numpy(np.array(posterior[idx], dtype=np.float32, copy=True)).to(device)
-    bicubic_batch = torch.from_numpy(np.array(bicubic[idx], dtype=np.float32, copy=True)).to(device)
-    with torch.no_grad():
-        # (B, 6, H, W): [q10_u, q10_v, q50_u, q50_v, q90_u, q90_v]
-        pred_batch = model(posterior_batch, bicubic_batch, terrain_raw).cpu().numpy()
-    if pred_batch.shape[1] != ProbabilisticSwin2SR.OUT_CHANNELS:
-        raise ValueError(
-            f"Expected a {ProbabilisticSwin2SR.OUT_CHANNELS}-channel quantile model output, got "
-            f"{pred_batch.shape[1]}. Is {checkpoint_path} a pre-0714 Gaussian/Cholesky checkpoint?"
-        )
-    # The CENTRAL field, the analog of the old predicted mean. Must be taken via Q50_SLICE:
+    # (B, 6, H, W): [q10_u, q10_v, q50_u, q50_v, q90_u, q90_v]. The CENTRAL field is the
+    # analog of the old predicted mean and must be taken via split_quantiles/Q50_SLICE:
     # channels 0-1 are q10 under the quantile head, so raw index 0/1 would silently plot the
     # lower envelope's spectrum as "SWIN output".
-    q50_batch = pred_batch[:, ProbabilisticSwin2SR.Q50_SLICE]  # (B, 2, H, W)
+    _q10, q50_batch, _q90 = split_quantiles(predict(ev, idx))  # q50: (B, 2, H, W)
 
     k_km, spectra = compute_spectra(idx, bicubic, posterior, wrf, q50_batch, args.dx_km, args.dy_km)
     plot_aggregate(idx, k_km, spectra, args.band, args.pct_lower, args.pct_upper, args.x_units, output_path,
                    zoom_km=args.zoom_km)
 
-    print(f"Checkpoint: {checkpoint_path} (epoch {ckpt.get('epoch')}, best_val_loss {ckpt.get('best_val_loss')})")
+    print(f"Checkpoint: {ev.describe_checkpoint()}")
     print(f"Split: {args.split}")
     print(f"Samples used ({len(idx)}): {idx.tolist()}")
 

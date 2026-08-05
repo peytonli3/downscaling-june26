@@ -53,13 +53,24 @@ RUNS_DIR = _env_dir("WIND_RUNS_DIR", REPO / "runs")
 SPLITS_PATH = DATA_DIR / "splits_70_15_15" / "split_indices.npz"
 
 
+def figures_dir(log_dir: str | os.PathLike) -> Path:
+    """Figure/CSV output directory for a run, addressed by its log_dir: <log_dir>/figures/.
+
+    The one place that spells this out. Scripts that read `paths.log_dir` from a config
+    (the recurring evals) go through here; scripts hard-wired to one historical run go
+    through `run_figures` below. Both name the same directory -- do not hand-write
+    `log_dir / "figures"` at a call site.
+    """
+    return Path(log_dir) / "figures"
+
+
 def run_figures(version: str) -> Path:
-    """Figure/CSV output directory for a run: runs/<version>/figures/.
+    """Figure/CSV output directory for a run, addressed by version: runs/<version>/figures/.
 
     Every per-version artifact lives under its run -- the old split of logs into
     a top-level `logs/` and figures into a top-level `inference_results/` is gone.
     """
-    return RUNS_DIR / version / "figures"
+    return figures_dir(RUNS_DIR / version)
 
 # The upstream raw dataset (ERA5 + WRF ensembles, lat/lon grids, event table).
 # Genuinely external to the repo -- everything in data/ is derived from it by the

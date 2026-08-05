@@ -24,13 +24,18 @@ description against current code/CHANGELOG rather than trusting a stale summary)
 
 ## Commands
 
-### Self-tests (there is no pytest suite)
+### Self-tests
 Scripts with meaningful logic end in a smoke test / self-test guarded by
-`if __name__ == "__main__"`:
+`if __name__ == "__main__"`, and `tests/` runs them as a set:
 ```
-python scripts/new_enscgp_swin.py     # model smoke test + pinball-quantile-recovery unit test
-python scripts/multiscale_loss.py     # loss self-test (band decomposition, shift-tolerance)
+python tests/test_selftests.py          # all of them (pytest is NOT installed; stdlib only)
+python tests/test_selftests.py --fast   # skip the ones that build a real model
+python scripts/new_enscgp_swin.py       # model smoke test + pinball-quantile-recovery unit test
+python scripts/multiscale_loss.py       # loss self-test (band decomposition, shift-tolerance)
+python scripts/quantile_metrics.py      # pinball/CRPS numpy-vs-torch agreement, rank_cdf
 ```
+`tests/test_selftests.py` is also a valid pytest module if you install pytest. A new
+self-test should be registered there -- one nothing runs is documentation, not a test.
 
 ### Train
 ```
@@ -49,9 +54,22 @@ python train_new_enscgp_swin.py [--config new_enscgp_swin_config.json] [--device
 Under `extra_scripts/swin/`: `eval_checkpoint.py` (panel figures),
 `eval_quantile_calibration.py` (PIT histogram + coverage maps),
 `compare_eigenspectra.py` (spectral fidelity of q50), `eval_pinball_impact.py`.
-Point `--checkpoint` at `runs/<version>/checkpoints/*.pth`; they all share
-`swin/_common.py`, so a new diagnostic should start from that harness rather
-than re-deriving the config/checkpoint/array loading.
+Point `--checkpoint` at `runs/<version>/checkpoints/*.pth` (it defaults to
+`<log_dir>/checkpoints/best.pth` from `--config`).
+
+They all go through `swin/_common.py`, and a new diagnostic must too:
+```python
+p = add_eval_args(argparse.ArgumentParser(description=__doc__))  # the shared flags
+args = p.parse_args()
+ev = setup(args)                       # config -> model+ckpt -> terrain -> mmapped arrays
+idx = choose_indices(split_pool(ev.splits_path, args.split), ev.arrays.n_total, ...)
+pred = predict(ev, idx)                # or iter_predictions(ev, idx) to stream a whole split
+fig.savefig(ev.figure_path("name.png"))
+```
+Re-deriving that preamble by hand is how these scripts drift apart; it is also
+how `plot_band_errors.py` ended up plotting `pred[:, :2]` (q10 under the
+quantile head) and labelling it the mean. Take q50 via `split_quantiles(...)`
+or `Q50_SLICE`, never a raw index.
 
 Multi-mode tools take a subcommand rather than existing as separate scripts:
 `enscgp/neighbor_mae.py {rank,mean,sweep-k,baseline}`,
@@ -116,6 +134,13 @@ always computed on validation as a diagnostic (`compute_all` in
   in this repo may hardcode an absolute path; add a constant here instead.
   Config values go through `paths.resolve()` (absolute wins, relative is
   repo-relative). `python scripts/paths.py` prints and checks every path.
+  Figure outputs go through `paths.figures_dir(log_dir)` / `paths.run_figures(version)`
+  (or `EvalSetup.figure_path`) -- never a hand-written `log_dir / "figures"`.
+- `scripts/quantile_metrics.py` -- the tau grid, its CRPS weights, `pinball`,
+  `crps_3q`, and `rank_cdf`, shared by the training loss and every diagnostic so
+  a run and the scorecard cannot score on different functionals. It imports
+  nothing from this repo, which is what makes it safe to import from
+  `swin/oneoff/_v6_common.py` (that module pins an OLD model class on sys.path).
 - `extra_scripts/` -- organized by pipeline stage, then by role:
   `data_prep/`, `enscgp/{,graphing/}`, `swin/{,graphing/,oneoff/}`,
   `presentation/`. The recurring evals sit at `swin/` top level;

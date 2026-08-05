@@ -63,97 +63,38 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
-
 
 from _common import (  # noqa: E402  (shared harness; also puts scripts/ on sys.path)
-    CRPS_TAUS, CRPS_WEIGHTS, DEFAULT_CONFIG_PATH, ProbabilisticSwin2SR, build_model,
-    choose_indices, crps_from_quantiles, load_config, load_terrain_input, pinball,
-    plot_panel, speed,
-    resolve_path,
+    add_eval_args, choose_indices, crps_3q, plot_panel, predict, setup, speed, split_pool,
 )
-
-# Quantile levels the model predicts, with midpoint-rule integration weights over tau in
-# [0, 1] (boundaries at 0.3 / 0.7) for the CRPS quantile decomposition -- see docstring.
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="new_enscgp_swin_config.json (architecture + default paths)")
-    parser.add_argument("--checkpoint", type=Path, default=None, help="Defaults to <log_dir>/checkpoints/best.pth from --config")
-    parser.add_argument("--data_dir", type=Path, default=None, help="Defaults to paths.data_dir from --config")
-    parser.add_argument("--splits_path", type=Path, default=None, help="Defaults to paths.splits_path from --config")
-    parser.add_argument("--era5_path", type=Path, default=None, help="Defaults to <data_dir>/era5_uv_2ch_native34.npy")
-    parser.add_argument("--wrf_path", type=Path, default=None, help="Defaults to <data_dir>/wrf_uv.npy")
-    parser.add_argument("--posterior_path", type=Path, default=None, help="Defaults to <data_dir>/enscgp_posterior.npy (EnsCGP first guess fed to the model)")
-    parser.add_argument("--bicubic_path", type=Path, default=None, help="Defaults to <data_dir>/era5_uv_2ch_bicubic.npy (bicubic baseline fed to the model)")
-    parser.add_argument("--hires_land_mask_path", type=Path, default=None, help="Defaults to <data_dir>/land_mask_hires.npz")
-    parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"], help="Sample pool for default random selection")
-    parser.add_argument("--n_samples", type=int, default=6, help="Number of random samples to visualize")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
-    parser.add_argument(
-        "--sample_indices", type=str, default=None,
-        help="Comma-separated raw sample indices (overrides --split/--n_samples/--seed), e.g. 0,25,100",
+    parser = add_eval_args(
+        argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter),
+        n_samples_default=6,
     )
     parser.add_argument("--output", type=Path, default=None, help="Output PNG. Defaults to <log_dir>/figures/swin_quantile_panels.png")
     parser.add_argument("--quiver_skip_lr", type=int, default=2, help="Arrow subsampling on the 34x34 ERA5 panel")
     parser.add_argument("--quiver_skip_hr", type=int, default=10, help="Arrow subsampling on the 200x200 panels")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dpi", type=int, default=150)
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    paths = config["paths"]
-    log_dir = resolve_path(paths["log_dir"])
-    data_dir = args.data_dir or resolve_path(paths["data_dir"])
-    checkpoint_path = args.checkpoint or (log_dir / "checkpoints" / "best.pth")
-    splits_path = args.splits_path or resolve_path(paths["splits_path"])
-    era5_path = args.era5_path or (data_dir / "era5_uv_2ch_native34.npy")
-    wrf_path = args.wrf_path or (data_dir / "wrf_uv.npy")
-    posterior_path = args.posterior_path or (data_dir / "enscgp_posterior.npy")
-    bicubic_path = args.bicubic_path or (data_dir / "era5_uv_2ch_bicubic.npy")
-    hires_land_mask_path = args.hires_land_mask_path or (data_dir / "land_mask_hires.npz")
-    output_path = args.output or (log_dir / "figures" / "swin_quantile_panels.png")
+    ev = setup(args)
+    era5, wrf, posterior = ev.arrays.era5, ev.arrays.wrf, ev.arrays.posterior
+    output_path = args.output or ev.figure_path("swin_quantile_panels.png")
 
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    idx = choose_indices(split_pool(ev.splits_path, args.split), ev.arrays.n_total,
+                         args.n_samples, args.seed, args.sample_indices)
 
-    device = torch.device(args.device)
-    model = build_model(config).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    terrain_raw = load_terrain_input(data_dir).unsqueeze(0).to(device)
+    lsm_era34, lsm_wrf = ev.arrays.land_masks()
 
-    era5 = np.load(era5_path, mmap_mode="r")
-    wrf = np.load(wrf_path, mmap_mode="r")
-    posterior = np.load(posterior_path, mmap_mode="r")
-    bicubic = np.load(bicubic_path, mmap_mode="r")
-    n_total = min(era5.shape[0], wrf.shape[0], posterior.shape[0], bicubic.shape[0])
-
-    splits = np.load(splits_path)
-    pool = splits[f"{args.split}_idx"]
-    idx = choose_indices(pool, n_total, args.n_samples, args.seed, args.sample_indices)
-
-    hires_masks = np.load(hires_land_mask_path)
-    lsm_era34 = hires_masks["era34"].astype(np.float64)
-    lsm_wrf = hires_masks["wrf"].astype(np.float64)
-
-    posterior_batch = torch.from_numpy(np.array(posterior[idx], dtype=np.float32, copy=True)).to(device)
-    bicubic_batch = torch.from_numpy(np.array(bicubic[idx], dtype=np.float32, copy=True)).to(device)
-    with torch.no_grad():
-        # (B, 6, 200, 200): [q10_u, q10_v, q50_u, q50_v, q90_u, q90_v]
-        pred_batch = model(posterior_batch, bicubic_batch, terrain_raw).cpu().numpy()
-    if pred_batch.shape[1] != ProbabilisticSwin2SR.OUT_CHANNELS:
-        raise ValueError(
-            f"Expected a {ProbabilisticSwin2SR.OUT_CHANNELS}-channel quantile model output, got "
-            f"{pred_batch.shape[1]}. Is {checkpoint_path} a pre-0714 Gaussian/Cholesky checkpoint?"
-        )
+    # (B, 6, 200, 200): [q10_u, q10_v, q50_u, q50_v, q90_u, q90_v]
+    pred_batch = predict(ev, idx)
 
     col_titles = [
         "ERA5 LR speed (34x34)",
@@ -188,8 +129,8 @@ def main() -> None:
 
         # CRPS per component (well posed: marginal quantiles vs that component's truth),
         # then averaged into a single map.
-        crps_u = crps_from_quantiles((q10_u, q50_u, q90_u), wrf_u)
-        crps_v = crps_from_quantiles((q10_v, q50_v, q90_v), wrf_v)
+        crps_u = crps_3q(q10_u, q50_u, q90_u, wrf_u)
+        crps_v = crps_3q(q10_v, q50_v, q90_v, wrf_v)
         crps = 0.5 * (crps_u + crps_v)
         crps_means.append(float(crps.mean()))
 
@@ -211,7 +152,7 @@ def main() -> None:
             plot_panel(axes[row, col], data, cmap, vmin, vmax, title, cbar_labels[col], lsm=lsm, uv=uv, quiver_skip=qskip)
 
     fig.suptitle(
-        f"SWIN quantile checkpoint eval vs ERA5 / WRF (split={args.split}, ckpt={checkpoint_path.name})",
+        f"SWIN quantile checkpoint eval vs ERA5 / WRF (split={args.split}, ckpt={ev.checkpoint.name})",
         fontsize=14, y=1.0,
     )
     fig.tight_layout()
@@ -221,7 +162,7 @@ def main() -> None:
     plt.close(fig)
 
     print(f"Saved figure: {output_path}")
-    print(f"Checkpoint: {checkpoint_path} (epoch {ckpt.get('epoch')}, best_val_loss {ckpt.get('best_val_loss')})")
+    print(f"Checkpoint: {ev.describe_checkpoint()}")
     print(f"Split: {args.split}")
     print(f"Samples used: {idx.tolist()}")
     print(f"Mean CRPS over shown samples: {np.mean(crps_means):.4f}  (per-sample: "

@@ -85,7 +85,23 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from quantile_metrics import rank_cdf
+
 DEFAULT_METRIC_PER_BAND = ("l1", "sw", "sw", "sw", "sw")  # coarse -> fine, len == n_levels
+
+
+def to_fine_first(per_band):
+    """Reverse a COARSE -> FINE per-band config into the FINEST -> COARSEST order the band
+    decompositions (laplacian_bands / fft_gaussian_bands) actually produce.
+
+    Both band losses take their per-band settings coarse -> fine, because that is how a
+    human reads "coarsest band first" in a config; both iterate finest -> coarsest, because
+    that is the order the filter banks emit. Every such config must cross that boundary
+    exactly once, here -- the two classes used to each do it their own way (one by index
+    arithmetic at call time, one by `reversed()` at construction), which is precisely the
+    setup for an off-by-one that silently mislabels which band got which setting.
+    """
+    return tuple(reversed(tuple(per_band)))
 
 
 # --------------------------------------------------------------------------------------
@@ -215,7 +231,56 @@ def load_or_compute_sigma_band(data_dir: Path, wrf_path: Path, train_idx: np.nda
 METRIC_SCALE = {"l1": 1.0, "sw": 2.75}
 
 
-class MultiscaleLoss:
+class _BandLoss:
+    """Shared skeleton for the two per-band losses below.
+
+    Both decompose pred/truth into `n_levels` bands, score each band per component (u, v)
+    against the truth, and normalize each score by that band+component's `sigma_band` before
+    summing -- only the DECOMPOSITION and the per-band SCORE differ. Subclasses supply those
+    two as `_iter_bands` and `_band_component_term`; the validation, the sigma flooring, and
+    the accumulation loop live here so they cannot drift apart.
+    """
+
+    def __init__(self, sigma_band: torch.Tensor, n_levels: int, base_sigma: float,
+                 sigma_floor: float = 1e-3, eps: float = 1e-8):
+        if sigma_band.shape != (n_levels, 2):
+            raise ValueError(f"sigma_band must have shape ({n_levels}, 2), got {tuple(sigma_band.shape)}")
+        self.n_levels = n_levels
+        self.base_sigma = base_sigma
+        self.eps = eps
+        # Floored ONCE at construction: a degenerate (near-zero) band sigma would otherwise
+        # turn into a huge loss weight amplifying that band's grid noise.
+        self.sigma_band = sigma_band.clamp_min(sigma_floor)  # (n_levels, 2)
+
+    def _check_per_band(self, name: str, value) -> None:
+        """Validate a per-band config sequence's length (coarse -> fine, len == n_levels)."""
+        if value is not None and len(value) != self.n_levels:
+            raise ValueError(f"{name} must have length n_levels={self.n_levels}, got {len(value)}")
+
+    def _iter_bands(self, pred: torch.Tensor, truth: torch.Tensor):
+        """Yield (band_index, pred_band, truth_band), FINEST -> COARSEST. A subclass may skip
+        a band entirely (rather than scoring it and multiplying by zero) to save its
+        decomposition cost."""
+        raise NotImplementedError
+
+    def _band_component_term(self, b: int, p: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Scalar score for band `b`, ONE component. p/t are (B, 1, H, W). Not yet divided
+        by sigma_band -- the caller does that."""
+        raise NotImplementedError
+
+    def __call__(self, pred_mean: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
+        """pred_mean/truth: (B, 2, H, W) [u, v] -> scalar."""
+        sigma = self.sigma_band.to(pred_mean.device)
+        total = pred_mean.new_zeros(())
+        for b, pred_band, truth_band in self._iter_bands(pred_mean, truth):
+            for c in range(2):
+                p = pred_band[:, c:c + 1]
+                t = truth_band[:, c:c + 1]
+                total = total + self._band_component_term(b, p, t) / (sigma[b, c] + self.eps)
+        return total
+
+
+class MultiscaleLoss(_BandLoss):
     """Callable: __call__(pred_mean, truth) -> scalar. pred_mean/truth: (B, 2, H, W) [u, v].
     See module docstring for the per-band/per-component formula. Independently
     toggleable/bisectable from the rest of the loss via ms_weight in the caller."""
@@ -225,21 +290,18 @@ class MultiscaleLoss:
                  patch_size: int = 8, patch_stride: int = 4, n_projections: int = 64,
                  sigma_floor: float = 1e-3, eps: float = 1e-8,
                  histogram_weight: float = 0.0):
-        if len(metric_per_band) != n_levels:
-            raise ValueError(f"metric_per_band must have length n_levels={n_levels}, got {len(metric_per_band)}")
+        super().__init__(sigma_band, n_levels, base_sigma, sigma_floor, eps)
+        self._check_per_band("metric_per_band", metric_per_band)
         for m in metric_per_band:
             if m not in ("l1", "sw"):
                 raise ValueError(f"metric_per_band entries must be 'l1' or 'sw', got {m!r}")
-        if sigma_band.shape != (n_levels, 2):
-            raise ValueError(f"sigma_band must have shape ({n_levels}, 2), got {tuple(sigma_band.shape)}")
-        self.n_levels = n_levels
-        self.base_sigma = base_sigma
+        # Kept coarse -> fine, as given and as logged by the caller; `_metric_fine_first` is
+        # the band-order copy the loop actually indexes (see to_fine_first).
         self.metric_per_band = tuple(metric_per_band)
+        self._metric_fine_first = to_fine_first(metric_per_band)
         self.patch_size = patch_size
         self.patch_stride = patch_stride
         self.n_projections = n_projections
-        self.eps = eps
-        self.sigma_band = sigma_band.clamp_min(sigma_floor)  # (n_levels, 2), floored once
         self.histogram_weight = histogram_weight
 
     def _band_metric(self, metric: str, p: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -249,24 +311,16 @@ class MultiscaleLoss:
             d = sliced_wasserstein_patches(p, t, self.patch_size, self.patch_stride, self.n_projections)
         return METRIC_SCALE[metric] * d
 
-    def __call__(self, pred_mean: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
-        pred_bands = laplacian_bands(pred_mean, self.n_levels, self.base_sigma)    # finest -> coarsest
+    def _iter_bands(self, pred: torch.Tensor, truth: torch.Tensor):
+        pred_bands = laplacian_bands(pred, self.n_levels, self.base_sigma)    # finest -> coarsest
         truth_bands = laplacian_bands(truth, self.n_levels, self.base_sigma)
-        sigma = self.sigma_band.to(pred_mean.device)
-        total = pred_mean.new_zeros(())
-        for b in range(self.n_levels):
-            # metric_per_band is coarse -> fine (see module docstring/DEFAULT_METRIC_PER_BAND);
-            # pred_bands/sigma_band are finest -> coarsest (laplacian_bands' own order) -- index
-            # from the other end to align them.
-            metric = self.metric_per_band[self.n_levels - 1 - b]
-            for c in range(2):
-                p = pred_bands[b][:, c:c + 1]
-                t = truth_bands[b][:, c:c + 1]
-                d = self._band_metric(metric, p, t)
-                total = total + d / (sigma[b, c] + self.eps)
-                if self.histogram_weight > 0:
-                    total = total + self.histogram_weight * histogram_wasserstein(p, t) / (sigma[b, c] + self.eps)
-        return total
+        yield from zip(range(self.n_levels), pred_bands, truth_bands)
+
+    def _band_component_term(self, b: int, p: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        term = self._band_metric(self._metric_fine_first[b], p, t)
+        if self.histogram_weight > 0:
+            term = term + self.histogram_weight * histogram_wasserstein(p, t)
+        return term
 
 
 # --------------------------------------------------------------------------------------
@@ -286,24 +340,37 @@ def _fft_gaussian_lp_masks(H: int, W: int, sigmas: list[float],
     ]
 
 
+def fft_band_masks(H: int, W: int, n_levels: int, base_sigma: float,
+                   device, dtype) -> list[torch.Tensor]:
+    """Band-pass transfer functions, finest -> coarsest, as (1, 1, H, W//2+1) tensors ready
+    to multiply an rfft2.
+
+    Successive differences of the low-pass masks, with the coarsest low-pass kept whole, so
+    the bands telescope back to the identity -- i.e. they sum to the field exactly (asserted
+    in self_test). The single definition behind both `fft_gaussian_bands` and
+    `FreqBandLoss._get_masks`; they used to build this list separately.
+    """
+    sigmas = band_sigmas(n_levels, base_sigma)
+    lp = _fft_gaussian_lp_masks(H, W, sigmas, device, dtype)
+    masks = [lp[j] - lp[j + 1] for j in range(n_levels - 1)]
+    masks.append(lp[-1])
+    return [m.unsqueeze(0).unsqueeze(0) for m in masks]
+
+
 def fft_gaussian_bands(field: torch.Tensor, n_levels: int, base_sigma: float) -> list[torch.Tensor]:
     """FFT Gaussian filter bank with the same sigma sequence as laplacian_bands.
     field: (B, C, H, W). Returns n_levels tensors (B, C, H, W), finest -> coarsest.
     Bands telescope exactly: sum(fft_gaussian_bands(field, ...)) == field."""
-    B, C, H, W = field.shape
-    sigmas = band_sigmas(n_levels, base_sigma)
-    lp = _fft_gaussian_lp_masks(H, W, sigmas, field.device, field.dtype)
+    H, W = field.shape[-2], field.shape[-1]
+    masks = fft_band_masks(H, W, n_levels, base_sigma, field.device, field.dtype)
     F_field = torch.fft.rfft2(field)
-    band_masks = [lp[j] - lp[j + 1] for j in range(n_levels - 1)]
-    band_masks.append(lp[-1])
-    return [torch.fft.irfft2(m.unsqueeze(0).unsqueeze(0) * F_field, s=(H, W))
-            for m in band_masks]
+    return [torch.fft.irfft2(m * F_field, s=(H, W)) for m in masks]
 
 
 # --------------------------------------------------------------------------------------
 # FreqBandLoss
 # --------------------------------------------------------------------------------------
-class FreqBandLoss:
+class FreqBandLoss(_BandLoss):
     """Per-band pointwise weighted L1 loss using an FFT Gaussian filter bank.
 
     Bands use the same sigma sequence as laplacian_bands (band_sigmas), so sigma_band
@@ -345,79 +412,54 @@ class FreqBandLoss:
                  cdf_weight_mode: str = "down_extremes", sigma_floor: float = 1e-3,
                  eps: float = 1e-8, band_weight: tuple[float, ...] | None = None,
                  pixel_weight_enabled: tuple[bool, ...] | None = None):
-        if sigma_band.shape != (n_levels, 2):
-            raise ValueError(f"sigma_band must have shape ({n_levels}, 2), got {tuple(sigma_band.shape)}")
+        super().__init__(sigma_band, n_levels, base_sigma, sigma_floor, eps)
         if cdf_weight_mode not in ("down_extremes", "up_extremes"):
             raise ValueError(f"cdf_weight_mode must be 'down_extremes' or 'up_extremes', got {cdf_weight_mode!r}")
-        if band_weight is not None and len(band_weight) != n_levels:
-            raise ValueError(f"band_weight must have length n_levels={n_levels}, got {len(band_weight)}")
-        if pixel_weight_enabled is not None and len(pixel_weight_enabled) != n_levels:
-            raise ValueError(f"pixel_weight_enabled must have length n_levels={n_levels}, "
-                             f"got {len(pixel_weight_enabled)}")
-        self.n_levels = n_levels
-        self.base_sigma = base_sigma
+        self._check_per_band("band_weight", band_weight)
+        self._check_per_band("pixel_weight_enabled", pixel_weight_enabled)
         self.cdf_weight_mode = cdf_weight_mode
-        self.eps = eps
-        self.sigma_band = sigma_band.clamp_min(sigma_floor)
-        # Both stored FINEST -> COARSEST (band b=0 in __call__'s loop is finest -- see
-        # _get_masks), the reverse of the constructor's coarse -> fine input, mirroring how
-        # MultiscaleLoss.__call__ reverses metric_per_band against the same band order.
-        self.band_weight = tuple(reversed(band_weight)) if band_weight is not None else (1.0,) * n_levels
-        self.pixel_weight_enabled = (tuple(reversed(pixel_weight_enabled)) if pixel_weight_enabled is not None
+        # Both stored FINEST -> COARSEST -- the order _iter_bands yields -- from the
+        # constructor's coarse -> fine input. See to_fine_first.
+        self.band_weight = to_fine_first(band_weight) if band_weight is not None else (1.0,) * n_levels
+        self.pixel_weight_enabled = (to_fine_first(pixel_weight_enabled) if pixel_weight_enabled is not None
                                      else (True,) * n_levels)
         self._mask_cache: dict = {}
 
     def _get_masks(self, H: int, W: int, device, dtype) -> list[torch.Tensor]:
         key = (H, W, str(device))
         if key not in self._mask_cache:
-            sigmas = band_sigmas(self.n_levels, self.base_sigma)
-            lp = _fft_gaussian_lp_masks(H, W, sigmas, device, dtype)
-            band_masks = [lp[j] - lp[j + 1] for j in range(self.n_levels - 1)]
-            band_masks.append(lp[-1])
-            self._mask_cache[key] = [m.unsqueeze(0).unsqueeze(0) for m in band_masks]
+            self._mask_cache[key] = fft_band_masks(H, W, self.n_levels, self.base_sigma, device, dtype)
         return self._mask_cache[key]
 
     def _pixel_weights(self, band_mag: torch.Tensor) -> torch.Tensor:
-        """band_mag: (B, 1, H, W) → (B, 1, H, W) weights normalized to mean=1 per sample."""
-        B, _, H, W = band_mag.shape
-        flat = band_mag.reshape(B, -1)          # (B, N)
-        N = flat.shape[1]
-        ranks = torch.argsort(torch.argsort(flat, dim=1), dim=1).float()   # [0..N-1]
-        if self.cdf_weight_mode == "down_extremes":
-            w = 1.0 - ranks / (N - 1)
-        else:
-            w = ranks / (N - 1)
-        w = w / w.mean(dim=1, keepdim=True).clamp_min(1e-12)
-        return w.reshape(B, 1, H, W)
+        """band_mag: (B, 1, H, W) → (B, 1, H, W) weights normalized to mean=1 per sample.
 
-    def __call__(self, pred_mean: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
-        """pred_mean/truth: (B, 2, H, W) → scalar."""
-        B, C, H, W = pred_mean.shape
-        sigma = self.sigma_band.to(pred_mean.device)
-        masks = self._get_masks(H, W, pred_mean.device, pred_mean.dtype)
+        n_leading=1: each SAMPLE is ranked against itself, so one unusually energetic sample
+        cannot flatten the rest's weights."""
+        cdf = rank_cdf(band_mag, n_leading=1)
+        w = (1.0 - cdf) if self.cdf_weight_mode == "down_extremes" else cdf
+        return w / w.mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-12)
 
-        pred_F = torch.fft.rfft2(pred_mean)
+    def _iter_bands(self, pred: torch.Tensor, truth: torch.Tensor):
+        H, W = pred.shape[-2], pred.shape[-1]
+        masks = self._get_masks(H, W, pred.device, pred.dtype)
+        pred_F = torch.fft.rfft2(pred)
         truth_F = torch.fft.rfft2(truth)
-
-        total = pred_mean.new_zeros(())
         for b, mask in enumerate(masks):
-            w = self.band_weight[b]
-            if w == 0.0:
+            if self.band_weight[b] == 0.0:
                 continue  # fully deactivated: skip this band's irfft2/pixel-weight cost too
-            pred_band = torch.fft.irfft2(mask * pred_F, s=(H, W))
-            truth_band = torch.fft.irfft2(mask * truth_F, s=(H, W))
-            weight_this_band = self.pixel_weight_enabled[b]
-            for c in range(2):
-                p = pred_band[:, c:c + 1]
-                t = truth_band[:, c:c + 1]
-                abs_err = (p - t).abs()
-                if weight_this_band:
-                    pw = self._pixel_weights(t.abs().detach())
-                    band_term = (pw * abs_err).mean()
-                else:
-                    band_term = abs_err.mean()  # unweighted: skip the rank/CDF cost entirely
-                total = total + w * band_term / (sigma[b, c] + self.eps)
-        return total
+            yield (b,
+                   torch.fft.irfft2(mask * pred_F, s=(H, W)),
+                   torch.fft.irfft2(mask * truth_F, s=(H, W)))
+
+    def _band_component_term(self, b: int, p: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        abs_err = (p - t).abs()
+        if self.pixel_weight_enabled[b]:
+            pw = self._pixel_weights(t.abs().detach())
+            band_term = (pw * abs_err).mean()
+        else:
+            band_term = abs_err.mean()  # unweighted: skip the rank/CDF cost entirely
+        return self.band_weight[b] * band_term
 
 
 # --------------------------------------------------------------------------------------
@@ -498,6 +540,36 @@ def _assert_freq_band_pixel_weights() -> None:
     assert flat_w[top_idx].mean() < flat_w[bot_idx].mean(), \
         "down_extremes: top-magnitude pixels should have lower weight than bottom-magnitude"
     print(f"  pixel_weights: mean=1.0 per sample OK; down_extremes direction OK")
+
+
+def _assert_per_band_config_alignment() -> None:
+    """Per-band config is given COARSE -> FINE but consumed FINEST -> COARSEST. Both classes
+    cross that boundary via to_fine_first; this pins down that they cross it exactly once
+    and in the same direction, since an off-by-one here silently applies every band's
+    setting to the wrong band instead of raising."""
+    ms = MultiscaleLoss(sigma_band=torch.ones(5, 2), metric_per_band=("l1", "sw", "sw", "sw", "sw"))
+    assert ms.metric_per_band == ("l1", "sw", "sw", "sw", "sw"), "public attr must stay coarse -> fine"
+    assert ms._metric_fine_first == ("sw", "sw", "sw", "sw", "l1"), \
+        f"coarsest band should get 'l1'; got {ms._metric_fine_first}"
+
+    fb = FreqBandLoss(sigma_band=torch.ones(5, 2), band_weight=(1, 2, 3, 4, 5),
+                      pixel_weight_enabled=(True, False, True, False, True))
+    assert fb.band_weight == (5, 4, 3, 2, 1), f"band_weight not reversed to fine-first: {fb.band_weight}"
+    assert fb.pixel_weight_enabled == (True, False, True, False, True)[::-1]
+
+    # Behavioural: a constant offset is pure DC, so it lands ENTIRELY in the coarsest
+    # (low-pass residual) band. Activating only the coarsest band must therefore see it, and
+    # deactivating only the coarsest band must not.
+    truth = torch.randn(2, 2, 64, 64)
+    pred = truth + 3.0
+    coarsest_only = FreqBandLoss(sigma_band=torch.ones(5, 2), band_weight=(1, 0, 0, 0, 0))(pred, truth)
+    coarsest_off = FreqBandLoss(sigma_band=torch.ones(5, 2), band_weight=(0, 1, 1, 1, 1))(pred, truth)
+    assert coarsest_only.item() > 1.0, \
+        f"a DC offset must show up in the coarsest band, got {coarsest_only.item():.2e} (band order flipped?)"
+    assert coarsest_off.item() < 1e-3, \
+        f"a DC offset must NOT show up in the finer bands, got {coarsest_off.item():.2e} (band order flipped?)"
+    print(f"  per-band config alignment: coarse->fine in, fine-first out; DC offset lands in the "
+          f"coarsest band only (on {coarsest_only.item():.3f} / off {coarsest_off.item():.2e}) OK")
 
 
 def _assert_freq_band_zero_loss() -> None:
@@ -593,6 +665,7 @@ def self_test() -> None:
     _assert_fft_bands_sum_to_field(n_levels=5, base_sigma=2.0)
     _assert_fft_bands_sum_to_field(n_levels=3, base_sigma=1.0)
     _assert_freq_band_pixel_weights()
+    _assert_per_band_config_alignment()
     _assert_freq_band_zero_loss()
     _assert_freq_band_fwd_bwd()
     print("Model integration:")

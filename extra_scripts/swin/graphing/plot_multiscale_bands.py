@@ -20,8 +20,8 @@ band_error_diagnostics.py's eigenspectrum-equivalent finding), so a shared scale
 render every band but the coarsest as a blank/uniform panel.
 
 References the structure of plot_enscgp_results.py in this same directory (random sample
-selection, one figure with a row per sample, land/sea contour overlay; plot_panel/
-choose_indices below are near-identical) -- but visualizes a decomposition of the ground
+selection, one figure with a row per sample, land/sea contour overlay; both now come
+from swin/_common.py) -- but visualizes a decomposition of the ground
 truth itself: runs no model, uses no EnsCGP/Swin output.
 
 Sanity check (printed, not plotted): asserts the bands sum back to the original WRF field
@@ -48,11 +48,13 @@ import torch
 
 REPO = next(p for p in Path(__file__).resolve().parents
             if (p / "scripts" / "paths.py").is_file())
-sys.path.insert(0, str(REPO / "scripts"))
+for _d in (REPO / "scripts", REPO / "extra_scripts" / "swin"):
+    sys.path.insert(0, str(_d))
 
 from paths import run_figures, resolve as resolve_path  # noqa: E402
 from new_enscgp_swin import DEFAULT_CONFIG_PATH, load_config  # noqa: E402
 from multiscale_loss import band_sigmas, laplacian_bands  # noqa: E402
+from _common import choose_indices, plot_panel, speed  # noqa: E402  (shared harness)
 
 # WRF native 200x200 grid spacing (km/pixel) -- same source/derivation as
 # band_error_diagnostics.py and compare_eigenspectra.py.
@@ -61,22 +63,17 @@ DX_KM = 3.48764
 PIXEL_KM = float(np.sqrt(DX_KM * DY_KM))  # isotropic-equivalent pixel size for scale labels
 
 
-def choose_indices(n_total: int, n_samples: int, seed: int, sample_indices: str | None) -> np.ndarray:
-    if sample_indices:
-        idx = np.array([int(x.strip()) for x in sample_indices.split(",") if x.strip() != ""], dtype=int)
-        if np.any(idx < 0) or np.any(idx >= n_total):
-            raise ValueError(f"sample_indices must be in [0, {n_total - 1}]")
-        return np.unique(idx)
+def choose_samples(n_total: int, n_samples: int, seed: int, sample_indices: str | None) -> np.ndarray:
+    """Sample selection over the WHOLE dataset rather than a split pool.
 
-    rng = np.random.default_rng(seed)
-    n = min(n_samples, n_total)
-    idx = rng.choice(n_total, size=n, replace=False)
-    idx.sort()
-    return idx
-
-
-def speed(u: np.ndarray, v: np.ndarray) -> np.ndarray:
-    return np.sqrt(u ** 2 + v ** 2)
+    No model is involved here (this visualizes a decomposition of the ground truth), so
+    there is no held-out constraint to respect and every index is fair game -- the only way
+    this differs from its sibling diagnostics. Expressed as `_common.choose_indices` over the
+    full index range (an identical draw: rng.choice(n) == rng.choice(arange(n))), so the
+    explicit-`--sample_indices` path is the same code as everywhere else rather than a third
+    copy of it.
+    """
+    return choose_indices(np.arange(n_total), n_total, n_samples, seed, sample_indices)
 
 
 def band_scale_labels(n_levels: int, base_sigma: float) -> list[str]:
@@ -92,17 +89,6 @@ def band_scale_labels(n_levels: int, base_sigma: float) -> list[str]:
         else:
             labels.append(f">{lo_km:.0f} km (residual)")
     return labels
-
-
-def plot_panel(ax, data: np.ndarray, cmap: str, vmin: float, vmax: float, title: str,
-                cbar_label: str, lsm: np.ndarray | None = None) -> None:
-    im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, origin="upper")
-    if lsm is not None:
-        ax.contour(lsm, levels=[0.5], colors="black", linewidths=0.8)
-    ax.set_title(title, fontsize=9)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    plt.colorbar(im, ax=ax, orientation="vertical", shrink=0.8, label=cbar_label)
 
 
 def main() -> None:
@@ -137,7 +123,7 @@ def main() -> None:
     hires_land_mask_path = args.hires_land_mask_path or (data_dir / "land_mask_hires.npz")
 
     wrf = np.load(wrf_path, mmap_mode="r")
-    idx = choose_indices(wrf.shape[0], args.n_samples, args.seed, args.sample_indices)
+    idx = choose_samples(wrf.shape[0], args.n_samples, args.seed, args.sample_indices)
 
     hires_masks = np.load(hires_land_mask_path)
     lsm_wrf = hires_masks["wrf"].astype(np.float64)

@@ -99,6 +99,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from new_enscgp_swin import DEFAULT_CONFIG_PATH, ProbabilisticSwin2SR, build_model, load_config
 from paths import resolve as resolve_path
+from quantile_metrics import CRPS_TAUS, crps_from_pinball, pinball, rank_cdf
 from terrain_encoder import load_terrain_input
 from multiscale_loss import DEFAULT_METRIC_PER_BAND, METRIC_SCALE, FreqBandLoss, MultiscaleLoss, load_or_compute_sigma_band
 
@@ -182,18 +183,6 @@ class MeanAuxLosses:
         return torch.mean(torch.abs(divergence(mu) - divergence(target)))
 
 
-def _rank_cdf_per_channel(x: torch.Tensor) -> torch.Tensor:
-    """x: (B,C,H,W), non-negative. Empirical CDF (rank/(N-1)) computed independently within
-    each (batch, channel) slice's H*W pixels -- so u and v (or any two channels) are ranked
-    against their OWN distribution, not mixed together. Same shape as x."""
-    B, C, H, W = x.shape
-    flat = x.reshape(B, C, H * W)
-    n = flat.shape[-1]
-    ranks = flat.argsort(dim=-1).argsort(dim=-1).to(x.dtype)
-    cdf = ranks / max(n - 1, 1)
-    return cdf.reshape(B, C, H, W)
-
-
 def extreme_pixel_weights_signed(target: torch.Tensor, alpha: float) -> tuple[torch.Tensor, torch.Tensor]:
     """Sign-aware extreme weighting for a SIGNED quantity (wind components u, v can be
     positive or negative -- a strong westward gust is exactly as extreme as an equally
@@ -201,7 +190,7 @@ def extreme_pixel_weights_signed(target: torch.Tensor, alpha: float) -> tuple[to
     is this pixel" means the same thing regardless of direction -- then ROUTED per pixel to
     whichever tail its sign indicates:
       w = 1 + alpha * F(|target|)     F = empirical CDF within each (sample, component)
-                                       independently (_rank_cdf_per_channel), mean-normalized
+                                       independently (quantile_metrics.rank_cdf), mean-normalized
       w_upper = w where target >= 0, else 1 (baseline -- nothing extreme for q90 to reach there)
       w_lower = w where target <  0, else 1 (baseline -- nothing extreme for q10 to reach there)
     Returns (w_upper, w_lower), each (B,2,H,W). DETACHED (no gradient through the ranking).
@@ -222,7 +211,8 @@ def extreme_pixel_weights_signed(target: torch.Tensor, alpha: float) -> tuple[to
     in, wasting half the pressure on a tail that had nothing to reach for there.
     """
     with torch.no_grad():
-        w = 1.0 + alpha * _rank_cdf_per_channel(target.abs())
+        # n_leading=2: rank within each (sample, component) slice -- see rank_cdf.
+        w = 1.0 + alpha * rank_cdf(target.abs(), n_leading=2)
         w = w / w.mean(dim=(2, 3), keepdim=True)  # mean-normalize per (B, C)
         is_pos = target >= 0
         ones = torch.ones_like(w)
@@ -233,38 +223,30 @@ def extreme_pixel_weights_signed(target: torch.Tensor, alpha: float) -> tuple[to
 
 def pinball_loss(q: torch.Tensor, target: torch.Tensor, tau: float,
                  weight: torch.Tensor | None = None) -> torch.Tensor:
-    """Mean pinball (tilted-L1) loss for quantile level tau: err = target - q;
-    loss = max(tau*err, (tau-1)*err) per pixel (== tau*err if target>q else (1-tau)*(q-target)).
+    """MEAN pinball loss for quantile level tau -- the elementwise definition lives in
+    quantile_metrics.pinball; this adds the optional weighting and the reduction.
     Fully differentiable in q. weight is (B,2,H,W) (per-component) or (B,1,H,W) (broadcasts
     over both components) if given."""
-    err = target - q
-    loss = torch.maximum(tau * err, (tau - 1.0) * err)  # (B, 2, H, W)
+    loss = pinball(q, target, tau)  # (B, 2, H, W)
     if weight is not None:
         loss = loss * weight
     return loss.mean()
 
 
-# 3-quantile CRPS. With only q10/q50/q90 available, the CRPS integral
-# int (F(x) - 1{x>=y})^2 dx is approximated by a midpoint rule over the quantile levels:
-# CRPS ~= 2 * sum_k w_k * pinball(q_k, y, tau_k) with w = (0.3, 0.4, 0.3) for
-# tau = (0.1, 0.5, 0.9) -- the same weights eval_model_scorecard.py and
-# _v6_common.crps_3q_approx use, so the numbers are directly comparable.
-CRPS_TAUS = (0.1, 0.5, 0.9)
-CRPS_WEIGHTS = (0.3, 0.4, 0.3)
-
-
 @torch.no_grad()
-def crps_3q(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Scalar 3-quantile CRPS. Deliberately UNWEIGHTED -- unlike the Pin term in
-    compute_weighted_loss, no extreme_cfg is applied. That is the whole point of using it to
-    select checkpoints: extreme weighting differs between runs (alpha, apply_to_q10, and the
-    pre/post-12fc4bb weighting implementation), so a run's own Pin/total is not comparable to
-    another run's, while this is the same functional for every run and every model."""
+def crps_3q_score(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Scalar 3-quantile CRPS over a batch (the tau grid and its integration weights come
+    from quantile_metrics, so this is the same functional eval_model_scorecard.py reports).
+
+    Deliberately UNWEIGHTED -- unlike the Pin term in compute_weighted_loss, no extreme_cfg
+    is applied. That is the whole point of using it to select checkpoints: extreme weighting
+    differs between runs (alpha, apply_to_q10, and the pre/post-12fc4bb weighting
+    implementation), so a run's own Pin/total is not comparable to another run's, while this
+    is the same functional for every run and every model."""
     slices = (ProbabilisticSwin2SR.Q10_SLICE, ProbabilisticSwin2SR.Q50_SLICE,
               ProbabilisticSwin2SR.Q90_SLICE)
-    total = sum(w * pinball_loss(pred[:, sl], target, tau)
-                for tau, w, sl in zip(CRPS_TAUS, CRPS_WEIGHTS, slices))
-    return 2.0 * total
+    return crps_from_pinball(*(pinball_loss(pred[:, sl], target, tau)
+                               for tau, sl in zip(CRPS_TAUS, slices)))
 
 
 def compute_weighted_loss(pred: torch.Tensor, target: torch.Tensor, weights: dict, mean_aux: MeanAuxLosses,
@@ -374,7 +356,7 @@ VAL_EXTRA_KEYS = ("crps",)
 # Metrics that may be named by training.selection_metric. Each is "lower is better" and each
 # is reported by evaluate(). "total" is the historical behavior and the ONLY one that depends
 # on the run's own loss weights and extreme_cfg -- which is exactly why it is a poor choice
-# for comparing across runs; see crps_3q.
+# for comparing across runs; see crps_3q_score.
 SELECTION_METRICS = ("crps", "l1", "total")
 # Coverage = fraction of truth pixels at or below each predicted quantile (target nominal
 # in parentheses). "_ext" variants restrict to the extreme tail (|wind| above its per-sample
@@ -411,7 +393,7 @@ def evaluate(model, loader, terrain_raw, device, weights: dict, mean_aux: MeanAu
              freq_loss_fn: FreqBandLoss | None = None,
              extreme_cfg: dict | None = None) -> dict:
     """Returns per-sample-averaged loss components, CRPS, and empirical coverage (see
-    compute_weighted_loss / crps_3q / coverage_metrics). Every structural term is computed
+    compute_weighted_loss / crps_3q_score / coverage_metrics). Every structural term is computed
     (compute_all=True) regardless of its weight -- this is the one place they're always
     visible, even while off during training; see compute_weighted_loss.
 
@@ -438,7 +420,7 @@ def evaluate(model, loader, terrain_raw, device, weights: dict, mean_aux: MeanAu
         b = posterior.shape[0]
         for k in LOSS_COMPONENT_KEYS:
             totals[k] += loss_dict[k].item() * b
-        totals["crps"] += crps_3q(pred, wrf).item() * b
+        totals["crps"] += crps_3q_score(pred, wrf).item() * b
         for k, (below, tot) in coverage_metrics(pred, wrf).items():
             cov_below[k] += below
             cov_total[k] += tot

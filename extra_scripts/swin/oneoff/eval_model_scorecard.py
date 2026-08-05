@@ -62,6 +62,7 @@ REPO = next(p for p in Path(__file__).resolve().parents
             if (p / "scripts" / "paths.py").is_file())
 # Importing this first pins sys.path (OLD_ARCH_DIR ahead of scripts/) and binds the v6 class.
 import _v6_common as common  # noqa: E402  (sibling)
+from quantile_metrics import crps_from_pinball, pinball  # noqa: E402  (shared with the training loss)
 
 RUNS_DIR = common.RUNS_DIR
 OUTPUT_DIR = RUNS_DIR / "0729_meangate/figures/scorecard"
@@ -144,11 +145,6 @@ def build_and_load(name: str, device):
     return model, slices, ckpt
 
 
-def pinball_t(q: torch.Tensor, y: torch.Tensor, tau: float) -> torch.Tensor:
-    err = y - q
-    return torch.maximum(tau * err, (tau - 1.0) * err)
-
-
 def extreme_mask(truth: torch.Tensor, ext_quantile: float = 0.9) -> torch.Tensor:
     """(B,2,H,W) bool. Exactly train_new_enscgp_swin.py::coverage_metrics' definition: pixels
     where the wind MAGNITUDE is at or above its own per-sample ext_quantile. The mask is
@@ -170,58 +166,46 @@ def event_metrics(model, slices, device, terrain_raw, split_map, split: str,
     denominator rather than assuming a shared one.
     """
     q10_sl, q50_sl, q90_sl = slices
-    posterior = np.load(common.DATA_DIR / "enscgp_posterior.npy", mmap_mode="r")
-    bicubic = np.load(common.DATA_DIR / "era5_uv_2ch_bicubic.npy", mmap_mode="r")
-    wrf = np.load(common.DATA_DIR / "wrf_uv.npy", mmap_mode="r")
-
-    events = split_map[split]
-    event_ids = np.array(sorted(events.keys()))
+    event_ids = common.select_event_ids(split_map, split)
     keys = list(BASE_KEYS) + [k + "_ext" for k in BASE_KEYS]
-    out = {k: np.zeros((len(event_ids), 2), dtype=np.float64) for k in keys}
+    E = len(event_ids)
+    # Accumulated on the GPU in float64, one row per event; divided by the matching count
+    # once the whole split has been walked.
+    acc = {k: torch.zeros(E, 2, dtype=torch.float64, device=device) for k in keys}
+    n_full = torch.zeros(E, 2, dtype=torch.float64, device=device)
+    n_ext = torch.zeros(E, 2, dtype=torch.float64, device=device)
 
-    for ei, eid in enumerate(event_ids):
-        idx = np.array(sorted(events[int(eid)]))
-        acc = {k: torch.zeros(2, dtype=torch.float64, device=device) for k in keys}
-        n_full = torch.zeros(2, dtype=torch.float64, device=device)
-        n_ext = torch.zeros(2, dtype=torch.float64, device=device)
+    for ei, _eid, pred, truth in common.iter_event_batches(
+            model, device, terrain_raw, split_map, split, batch_size):
+        y = truth.double()
+        q10, q50, q90 = pred[:, q10_sl].double(), pred[:, q50_sl].double(), pred[:, q90_sl].double()
 
-        for s in range(0, len(idx), batch_size):
-            b = idx[s:s + batch_size]
-            post_b = torch.from_numpy(np.array(posterior[b], dtype=np.float32, copy=True)).to(device)
-            bic_b = torch.from_numpy(np.array(bicubic[b], dtype=np.float32, copy=True)).to(device)
-            y = torch.from_numpy(np.array(wrf[b], dtype=np.float32, copy=True)).to(device).double()
+        p10, p50, p90 = (pinball(q10, y, 0.1), pinball(q50, y, 0.5), pinball(q90, y, 0.9))
+        per_pixel = {
+            "abs_err": (q50 - y).abs(),
+            "sq_err": (q50 - y) ** 2,
+            "err": q50 - y,
+            # Shares its weights with every other CRPS in the repo (quantile_metrics), and
+            # reuses the pinball terms already computed above rather than redoing them.
+            "crps": crps_from_pinball(p10, p50, p90),
+            "pin10": p10,
+            "pin90": p90,
+            "cov_q10": (y <= q10).double(),
+            "cov_q50": (y <= q50).double(),
+            "cov_q90": (y <= q90).double(),
+            "width": q90 - q10,
+        }
+        ext = extreme_mask(y)
+        for k, v in per_pixel.items():
+            acc[k][ei] += v.sum(dim=(0, 2, 3))
+            acc[k + "_ext"][ei] += (v * ext).sum(dim=(0, 2, 3))
+        n_full[ei] += float(y.shape[0] * y.shape[2] * y.shape[3])
+        n_ext[ei] += ext.sum(dim=(0, 2, 3)).double()
 
-            pred = model(post_b, bic_b, terrain_raw)
-            q10 = pred[:, q10_sl].double()
-            q50 = pred[:, q50_sl].double()
-            q90 = pred[:, q90_sl].double()
-
-            p10, p50, p90 = (pinball_t(q10, y, 0.1), pinball_t(q50, y, 0.5), pinball_t(q90, y, 0.9))
-            per_pixel = {
-                "abs_err": (q50 - y).abs(),
-                "sq_err": (q50 - y) ** 2,
-                "err": q50 - y,
-                # Same midpoint-rule 3-quantile CRPS as _v6_common.crps_3q_approx
-                # (weights 0.3/0.4/0.3, doubled) -- kept in torch to stay on the GPU.
-                "crps": 2.0 * (0.3 * p10 + 0.4 * p50 + 0.3 * p90),
-                "pin10": p10,
-                "pin90": p90,
-                "cov_q10": (y <= q10).double(),
-                "cov_q50": (y <= q50).double(),
-                "cov_q90": (y <= q90).double(),
-                "width": q90 - q10,
-            }
-            ext = extreme_mask(y)
-            for k, v in per_pixel.items():
-                acc[k] += v.sum(dim=(0, 2, 3))
-                acc[k + "_ext"] += (v * ext).sum(dim=(0, 2, 3))
-            n_full += float(y.shape[0] * y.shape[2] * y.shape[3])
-            n_ext += ext.sum(dim=(0, 2, 3)).double()
-
-        for k in BASE_KEYS:
-            out[k][ei] = (acc[k] / n_full).cpu().numpy()
-            out[k + "_ext"][ei] = (acc[k + "_ext"] / n_ext.clamp_min(1.0)).cpu().numpy()
-
+    out = {}
+    for k in BASE_KEYS:
+        out[k] = (acc[k] / n_full).cpu().numpy()
+        out[k + "_ext"] = (acc[k + "_ext"] / n_ext.clamp_min(1.0)).cpu().numpy()
     return event_ids, out
 
 
