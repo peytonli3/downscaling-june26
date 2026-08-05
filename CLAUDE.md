@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Wind downscaling: an EnsCGP (ensemble-conditional Gaussian process) posterior
 first-guess, refined by a Swin2SR-based transformer, trained to predict
 per-pixel quantiles (q10/q50/q90) of ERA5-to-WRF downscaled wind (u, v).
-See `README.md` for the versioning workflow and `CHANGELOG.md` for the full
+See `README.md` for the versioning workflow and `docs/CHANGELOG.md` for the full
 architecture history (read the most recent entries before touching the model
 or loss -- this repo's architecture changes frequently, so verify any prior
 description against current code/CHANGELOG rather than trusting a stale summary).
@@ -118,7 +118,7 @@ always computed on validation as a diagnostic (`compute_all` in
   repo-relative). `python scripts/paths.py` prints and checks every path.
 - `extra_scripts/` -- organized by pipeline stage, then by role:
   `data_prep/`, `enscgp/{,graphing/}`, `swin/{,graphing/,oneoff/}`,
-  `presentation/`, `vendor/`. The recurring evals sit at `swin/` top level;
+  `presentation/`. The recurring evals sit at `swin/` top level;
   `swin/oneoff/` holds one-time investigations kept for provenance.
 - Modules starting with `_` are shared helpers, never entry points:
   `swin/_common.py` (eval harness), `enscgp/_common.py` (neighbor loaders),

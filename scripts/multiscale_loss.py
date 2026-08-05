@@ -520,21 +520,29 @@ def _assert_freq_band_fwd_bwd() -> None:
 
 
 def _assert_gate_fwd_bwd() -> None:
-    """One real fwd+bwd: NLL + multiscale_loss at batch=4, gradients flow, no error.
-    Imports the actual model -- run from scripts/ so new_enscgp_swin's relative imports
-    (network_swin2sr, terrain_encoder) resolve."""
+    """One real fwd+bwd against the live model: multiscale_loss on q50 + pinball on
+    q10/q90, batch=4, gradients reach the backbone and BOTH heads.
+
+    This mirrors how train_new_enscgp_swin.py actually wires the loss: the structural
+    term supervises q50 only (reaching the backbone through mean_head/mean_gate), and
+    pinball supervises q10/q90 only (reaching it through offset_head). Checking both
+    paths in one backward is the point -- a structural-only loss would still pass
+    while offset_head sat dead.
+
+    Imports the actual model -- run from scripts/ so new_enscgp_swin's relative
+    imports (network_swin2sr, terrain_encoder) resolve.
+    """
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from new_enscgp_swin import ProbabilisticSwin2SR
-    from terrain_encoder import load_terrain_input
 
     torch.manual_seed(0)
     model = ProbabilisticSwin2SR(img_size=200, embed_dim=24, depths=(2,), num_heads=(4,))
     model.train()
     B = 4
     posterior = torch.randn(B, 5, 200, 200)
-    posterior[:, 2] = F.softplus(posterior[:, 2])
-    posterior[:, 4] = F.softplus(posterior[:, 4])
+    posterior[:, 2] = F.softplus(posterior[:, 2])  # L11 > 0
+    posterior[:, 4] = F.softplus(posterior[:, 4])  # L22 > 0
     bicubic = torch.randn(B, 2, 200, 200)
     wrf = torch.randn(B, 2, 200, 200)
     terrain_raw = torch.randn(1, 4, 1000, 1000)
@@ -543,20 +551,29 @@ def _assert_gate_fwd_bwd() -> None:
     ms_loss_fn = MultiscaleLoss(sigma_band=sigma_band, n_levels=5)
 
     pred = model(posterior, bicubic, terrain_raw)
-    mu, L11, L21, L22 = pred[:, :2], pred[:, 2].clamp_min(1e-6), pred[:, 3], pred[:, 4].clamp_min(1e-6)
-    z1 = (wrf[:, 0] - mu[:, 0]) / L11
-    z2 = (wrf[:, 1] - mu[:, 1] - L21 * z1) / L22
-    nll = (torch.log(L11) + torch.log(L22) + 0.5 * (z1 ** 2 + z2 ** 2)).mean()
-    ms = ms_loss_fn(mu, wrf)
-    total = 0.5 * nll + 1.0 * ms
+    q10 = pred[:, ProbabilisticSwin2SR.Q10_SLICE]
+    q50 = pred[:, ProbabilisticSwin2SR.Q50_SLICE]
+    q90 = pred[:, ProbabilisticSwin2SR.Q90_SLICE]
+
+    def pinball(q: torch.Tensor, tau: float) -> torch.Tensor:
+        err = wrf - q
+        return torch.maximum(tau * err, (tau - 1.0) * err).mean()
+
+    ms = ms_loss_fn(q50, wrf)
+    pin = pinball(q90, 0.9) + pinball(q10, 0.1)
+    total = ms + pin
 
     model.zero_grad()
     total.backward()
-    assert model.conv_first.weight.grad is not None and model.conv_first.weight.grad.abs().max().item() > 0
-    assert model.mean_gate.grad is not None and model.mean_gate.grad.abs().item() > 0
-    assert model.chol_gate.grad is not None and model.chol_gate.grad.abs().item() > 0
-    print(f"  Fwd+bwd (batch={B}): NLL={nll.item():.4f}, multiscale_loss={ms.item():.4f}, "
-          f"total={total.item():.4f}, gradients flow to backbone + both gates OK")
+    assert model.conv_first.weight.grad is not None and model.conv_first.weight.grad.abs().max().item() > 0, \
+        "backbone received no gradient"
+    assert model.mean_gate.grad is not None and model.mean_gate.grad.abs().item() > 0, \
+        "mean_gate received no gradient (structural loss is not reaching q50)"
+    offset_w = model.offset_head[-1].weight
+    assert offset_w.grad is not None and offset_w.grad.abs().max().item() > 0, \
+        "offset_head received no gradient (pinball is not reaching q10/q90)"
+    print(f"  Fwd+bwd (batch={B}): multiscale_loss={ms.item():.4f}, pinball={pin.item():.4f}, "
+          f"total={total.item():.4f}, gradients flow to backbone + mean_gate + offset_head OK")
 
 
 def self_test() -> None:

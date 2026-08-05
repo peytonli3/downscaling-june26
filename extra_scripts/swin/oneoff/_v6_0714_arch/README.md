@@ -13,7 +13,7 @@ depending on git state at run time (a shallow clone or a source tarball has no
 
 ## Why a copy rather than the current class
 
-0714 predates several architecture changes (see `CHANGELOG.md`: the v7
+0714 predates several architecture changes (see `docs/CHANGELOG.md`: the v7
 simplification dropped the gates, the EnsCGP-seeded spread, and the
 bicubic-residual input decomposition). Loading its checkpoint with the *current*
 `ProbabilisticSwin2SR` either fails `load_state_dict` outright or — worse —

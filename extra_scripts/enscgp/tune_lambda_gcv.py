@@ -1,5 +1,6 @@
 """Select the GCV-optimal EnsCGP regularization lambda (= sigma_obs^2) analytically,
-via select_regularization_gcv from extra_scripts/vendor/ken_enscgp/utils.py.
+via select_regularization_gcv from the research group's Ens-CGP implementation (not
+bundled here -- see WIND_KEN_ENSCGP_DIR below).
 
 Context: tune_sigma.py finds sigma by bisecting for a target posterior
 spread-skill ratio -- an empirical spread-calibration criterion, evaluated by
@@ -46,10 +47,23 @@ import numpy as np
 REPO = next(p for p in Path(__file__).resolve().parents
             if (p / "scripts" / "paths.py").is_file())
 sys.path.insert(0, str(REPO / "scripts"))
-sys.path.insert(0, str(REPO / "extra_scripts" / "vendor" / "ken_enscgp"))
 
-from paths import DATA_DIR as DEFAULT_DATA_DIR  # noqa: E402
+from paths import DATA_DIR as DEFAULT_DATA_DIR, KEN_ENSCGP_DIR  # noqa: E402
 from enscgp_train import load_hr, load_neighbors  # noqa: E402
+
+# select_regularization_gcv comes from the research group's Ens-CGP implementation,
+# which is NOT redistributed with this repository (it is not ours to publish). This
+# is the only script that needs it; everything else here runs without it.
+if KEN_ENSCGP_DIR is None or not (KEN_ENSCGP_DIR / "utils.py").is_file():
+    raise SystemExit(
+        "tune_lambda_gcv.py needs the group's Ens-CGP `utils.select_regularization_gcv`,\n"
+        "which is not bundled with this repository. Point WIND_KEN_ENSCGP_DIR at a\n"
+        "checkout containing utils.py:\n"
+        "    WIND_KEN_ENSCGP_DIR=/path/to/ken_enscgp python tune_lambda_gcv.py ...\n"
+        "Every other script in this repo runs without it."
+    )
+sys.path.insert(0, str(KEN_ENSCGP_DIR))
+
 from utils import select_regularization_gcv  # noqa: E402
 
 

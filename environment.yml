@@ -1,0 +1,41 @@
+# Conda environment for 26.6_wind.
+#
+#   conda env create -f environment.yml
+#   conda activate downscaling_all
+#
+# Versions are those the results in this repo were produced with. PyTorch is
+# pinned to a CUDA 11.8 build; on a different driver, install torch separately
+# from https://pytorch.org and drop the pytorch/pytorch-cuda lines below.
+#
+# Only `pip install python-pptx` is needed if you never regenerate the slides
+# (extra_scripts/presentation/); everything else is used by the pipeline proper.
+name: downscaling_all
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  # core numerics
+  - numpy=1.26
+  - scipy=1.15
+  # model
+  - pytorch=2.5.1
+  - pytorch-cuda=11.8
+  # geospatial / IO -- data_prep/ reads wndata.mat (HDF5) and a Copernicus DEM GeoTIFF,
+  # and rasterizes Natural Earth coastlines for the land masks
+  - h5py=3.16
+  - rasterio=1.4
+  - cartopy=0.21
+  - shapely=1.8
+  # analysis + plotting
+  - matplotlib=3.10
+  - scikit-learn=1.7
+  - scikit-image=0.19
+  - pillow=9.2
+  - pip
+  - pip:
+      # not on conda-forge for this Python/CUDA combination
+      - timm==1.0.24
+      # presentation generators only
+      - python-pptx==1.0.2
