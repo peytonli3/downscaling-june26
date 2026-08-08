@@ -72,35 +72,27 @@ extra_scripts/
 runs/<version>/       Everything a run produced:
                         train_*.log        (tracked)
                         checkpoints/*.pth  (gitignored)
-                        figures/           (gitignored except *.csv)
+                        figures/           (gitignored except *.csv, incl. subdirs)
                         config.json        (tracked, where present)
 data/                 Inputs + derived arrays. Gitignored; see data/README.md.
 docs/CHANGELOG.md     Checkpoint-incompatible architecture changes, by version.
 docs/figures/         Figures committed deliberately (README illustrations).
 ```
 
-Only `scripts/` and `extra_scripts/` are code. Everything under `runs/` is
-output, so it can be regenerated, blanket-ignored, or deleted without touching
-source — which is why the presentation generators live in `extra_scripts/` even
-though their `.pptx` output lands in `runs/`.
+Only `scripts/` and `extra_scripts/` are code. Everything under `runs/` is output,
+so it can be regenerated, blanket-ignored, or deleted without touching source.
 
-## Paths
+## Setup
 
-Nothing in this repo hardcodes an absolute path. `scripts/paths.py` is the single
-source: it locates the repo from its own file location and exports `REPO`,
-`DATA_DIR`, `RUNS_DIR`, `SPLITS_PATH`, plus `resolve()` for config values (which
-may be absolute or repo-relative). Scripts outside `scripts/` bootstrap with:
-
-```python
-REPO = next(p for p in Path(__file__).resolve().parents
-            if (p / "scripts" / "paths.py").is_file())
-sys.path.insert(0, str(REPO / "scripts"))
+```bash
+conda env create -f environment.yml
+conda activate downscaling_all
 ```
 
-That walks *up* rather than counting `.parent` hops, so moving a script between
-subdirectories cannot silently break it.
-
-Environment overrides, for pointing the heavy trees at other storage:
+No file in this repo hardcodes an absolute path to its own contents —
+`scripts/paths.py` resolves those from the repo root, so a clone works wherever it
+is checked out. That module also holds the defaults for the two genuinely external
+inputs (the upstream `.mat` and the DEM). Override any of these to point elsewhere:
 
 | Variable | Default |
 |---|---|
@@ -110,7 +102,8 @@ Environment overrides, for pointing the heavy trees at other storage:
 | `WIND_DEM_TIF`  | the Copernicus DEM clip |
 | `WIND_KEN_ENSCGP_DIR` | unset — only `enscgp/tune_lambda_gcv.py` needs it (see below) |
 
-`python scripts/paths.py` prints every resolved path and whether it exists.
+`python scripts/paths.py` prints every resolved path and whether it exists —
+run it first to check the data tree is where the code expects.
 
 ### One external dependency, not bundled
 
@@ -122,7 +115,7 @@ otherwise. **Every other script in this repository runs without it.**
 
 ## Running things
 
-Training (see `CLAUDE.md` for the conda env and GPU etiquette):
+Training:
 
 ```bash
 cd scripts
@@ -147,30 +140,21 @@ is opt-in).
 
 ## Versioning
 
-**A checkpoint-incompatible change = a git tag.**
+A checkpoint-incompatible architecture change gets a git tag (`vN-<date>`), so
+`git checkout <tag>` restores the exact model, trainer, and config that produced a
+run's checkpoints. **`docs/CHANGELOG.md` is the architecture history** — what broke
+compatibility and why, newest first, including the two versions whose source did not
+survive. Not every experimental change is tagged; check `git log --oneline` too.
+
+The newest tag is `v7-0729`, but it is **not** the tip: commit `a2d37ad`
+(`0729_meangate`) restores `mean_gate`, is checkpoint-incompatible with `v7-0729`,
+and is the model behind the results above. It is not yet tagged.
+
+The `archive/*` tags hold retired lines — `pre-reorg-snapshots` (the original tree),
+`resnet-refiner`, `variance-conditioning`. Read one without checking it out:
 
 ```bash
-git commit -am "vN: <what broke compatibility>"
-git tag vN-<date>
+git show archive/pre-reorg-snapshots:scripts/0626_v1/new_enscgp_swin.py
 ```
 
-`git checkout <tag>` restores the exact model/train/config for that version.
-Not every experimental change is tagged — check `git log --oneline` too.
-
-- `v7-0729` is the newest tag, but it is **not** the tip: the tip carries the
-  `0729_meangate` ablation (commit `a2d37ad`, which restores `mean_gate`, so its
-  checkpoints are incompatible with `v7-0729`'s) and is not yet tagged.
-  `runs/0729_meangate/` is the current `log_dir` and the source of the results
-  above — see the `0729_meangate` entry in `docs/CHANGELOG.md`.
-- `archive/pre-reorg-snapshots` holds the original tree including the `0626_v1`
-  and `0628_v2` snapshot dirs. Read without checking out:
-  `git show archive/pre-reorg-snapshots:scripts/0626_v1/new_enscgp_swin.py`
-- `archive/resnet-refiner` — the retired ResNet-refiner line.
-- `archive/variance-conditioning` — the retired `variance_conditioning` path.
-- **v2 (0627) and v4 (0629) code is not recoverable** — it was overwritten in a
-  mutable `scripts/` before git existed. `docs/CHANGELOG.md` describes the diffs, but
-  there is no source snapshot. This is the gap git now closes.
-
-Retired binaries (old checkpoints, optuna studies, dead data products) live
-outside the repo in `../26.6_wind_archive/`; the code that produced them is
-recoverable from the `archive/*` tags above.
+Their binaries live outside the repo in `../26.6_wind_archive/`.
