@@ -7,9 +7,17 @@ data/*
 
 # Per-run outputs. Small text (*.log, *.csv, config.json) is tracked as cheap
 # history; the heavy regenerable artifacts are not.
+# The figures/ rules must re-include the SUBDIRECTORIES too: git never descends
+# into an excluded directory, so a bare `!runs/*/figures/*.csv` silently misses
+# every CSV one level down (scorecard/, band_crossover/) -- which is how the
+# scorecard the README cites went uncommitted.
 runs/*/checkpoints/
 runs/*/figures/*
+!runs/*/figures/*/
+runs/*/figures/*/*
 !runs/*/figures/*.csv
+!runs/*/figures/*/*.csv
+!runs/*/figures/*/FINDINGS.md
 runs/*/presentation/*.pptx
 
 # Python caches
