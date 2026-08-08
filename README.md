@@ -61,7 +61,7 @@ scripts/              The live pipeline. Flat by design -- modules import each o
                       by bare name. paths.py resolves every path in the repo.
 extra_scripts/
   data_prep/          Builds data/ from the upstream wndata.mat + DEM.
-  enscgp/             EnsCGP stage: sigma/lambda tuning, neighbor diagnostics,
+  enscgp/             EnsCGP stage: sigma tuning, neighbor diagnostics,
                       variance recalibration.  graphing/ for its plots.
   swin/               Swin stage. The recurring evals live at this level;
                       _common.py is the shared harness they all use.
@@ -100,18 +100,12 @@ inputs (the upstream `.mat` and the DEM). Override any of these to point elsewhe
 | `WIND_RUNS_DIR` | `<repo>/runs` |
 | `WIND_MAT_PATH` | the upstream `wndata.mat` |
 | `WIND_DEM_TIF`  | the Copernicus DEM clip |
-| `WIND_KEN_ENSCGP_DIR` | unset — only `enscgp/tune_lambda_gcv.py` needs it (see below) |
 
 `python scripts/paths.py` prints every resolved path and whether it exists —
 run it first to check the data tree is where the code expects.
 
-### One external dependency, not bundled
-
-`extra_scripts/enscgp/tune_lambda_gcv.py` calls `select_regularization_gcv` from
-the research group's Ens-CGP implementation (Ravela et al., arXiv:2602.13871),
-which is not redistributed here. Point `WIND_KEN_ENSCGP_DIR` at a checkout
-containing its `utils.py` to run that one script; it exits with instructions
-otherwise. **Every other script in this repository runs without it.**
+Every script in this repository runs on `environment.yml` alone; nothing here
+depends on code that is not bundled.
 
 ## Running things
 

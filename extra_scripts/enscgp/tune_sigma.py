@@ -41,6 +41,30 @@ decouple   Part 1: Spearman correlation between predicted spread and realized
            from a MAE-tuned sigma and the spread from an SSR-tuned one, to see
            whether that beats the compromise a single sigma forces.
 
+Considered and rejected: analytic GCV
+------------------------------------
+The research group's Ens-CGP implementation ships `select_regularization_gcv`, which
+picks the regularization lambda (= sigma_obs^2) analytically from an ensemble's own
+geometry -- no bisection, no re-running enscgp(), no ERA5 observation needed. A
+`tune_lambda_gcv.py` here tried it; that script was removed (2026-08-08) together with
+the un-redistributable dependency it needed. Why it does not apply, recorded so nobody
+re-derives it:
+
+- Its `beta = U.T @ dY` step needs the SVD input and the regression target in the SAME
+  pixel space -- ken_enscgp_model.py's built-in H=identity assumption (its
+  build_training_matrices applies one shared nanmask to both X and Y). This repo
+  conditions with a genuine HR->LR coarsening operator, so U from SVD(H @ A) is 2178
+  rows (observation space) and cannot multiply A's 80000 rows (full HR space). Trying
+  it directly raises a shape mismatch.
+- It CAN be forced to run by using era5_uv_2ch_bicubic.npy as the X side (ERA5 already
+  resampled onto the same 200x200 grid as WRF, index-aligned with wrf_uv.npy), so X and
+  Y share one grid. But that answers a question about the bicubic-vs-WRF regression,
+  not about the H-coarsened conditioning the pipeline actually performs.
+- Even where it runs, GCV minimizes prediction error, which makes it an alternative to
+  sigma_mean (accurate posterior mean), never to sigma_spread -- it will not target
+  SSR == 1 the way `ssr` above does, and SSR is the calibration problem that motivated
+  tuning sigma in the first place.
+
 Every mode precomputes (mean, A, y) per sample once -- only R_inv depends on sigma --
 and reuses it across all candidate sigmas. No disk writes.
 

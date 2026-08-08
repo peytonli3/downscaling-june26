@@ -84,12 +84,6 @@ WNDATA_MAT = Path(os.environ.get(
 COPERNICUS_DEM_TIF = Path(os.environ.get(
     "WIND_DEM_TIF", "/home/peytonli/26.3_wind/SWIN/preprocessed/copernicus_dem_clip.tif"))
 
-# The research group's Ens-CGP reference implementation (Ravela et al.,
-# arXiv:2602.13871). NOT redistributed with this repo -- it is not ours to
-# publish. Only enscgp/tune_lambda_gcv.py needs it; point WIND_KEN_ENSCGP_DIR at
-# a checkout containing utils.py to run that one script.
-KEN_ENSCGP_DIR = Path(os.environ["WIND_KEN_ENSCGP_DIR"]) if "WIND_KEN_ENSCGP_DIR" in os.environ else None
-
 
 def resolve(path: str | os.PathLike) -> Path:
     """Resolve a config-supplied path: absolute wins, relative is REPO-relative."""
