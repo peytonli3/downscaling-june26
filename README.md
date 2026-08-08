@@ -141,7 +141,9 @@ python graphing/plot_training_curves.py --log_dir ../../runs/<version>
 ```
 
 Multi-mode tools take a subcommand: `neighbor_mae.py {rank,mean,sweep-k,baseline}`,
-`tune_sigma.py {ssr,mae,decouple}`, `bias_diagnostic.py --part {a,b,c,d,all}`.
+`tune_sigma.py {ssr,mae,decouple}`,
+`bias_diagnostic.py --part {a,b,c,d,a_meangate,all}` (`all` runs a–d; `a_meangate`
+is opt-in).
 
 ## Versioning
 
@@ -155,7 +157,11 @@ git tag vN-<date>
 `git checkout <tag>` restores the exact model/train/config for that version.
 Not every experimental change is tagged — check `git log --oneline` too.
 
-- Current tip is tagged `v7-0729`.
+- `v7-0729` is the newest tag, but it is **not** the tip: the tip carries the
+  `0729_meangate` ablation (restores `mean_gate`, so its checkpoints are
+  incompatible with `v7-0729`'s) and is not yet tagged. `runs/0729_meangate/` is
+  the current `log_dir` and the source of the results above — see
+  `docs/CHANGELOG.md`.
 - `archive/pre-reorg-snapshots` holds the original tree including the `0626_v1`
   and `0628_v2` snapshot dirs. Read without checking out:
   `git show archive/pre-reorg-snapshots:scripts/0626_v1/new_enscgp_swin.py`

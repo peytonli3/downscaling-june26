@@ -1,9 +1,10 @@
 {
   "seed": 0,
   "paths": {
-    "data_dir": "/home/peytonli/26.6_wind/data",
-    "log_dir": "/home/peytonli/26.6_wind/runs/0714_freq0",
-    "splits_path": "/home/peytonli/26.6_wind/data/splits_70_15_15/split_indices.npz"
+    "COMMENT": "Repo-relative (resolved by paths.resolve()); these were absolute when the run executed, rewritten so a clone can re-run the ablation unedited.",
+    "data_dir": "data",
+    "log_dir": "runs/0714_freq0",
+    "splits_path": "data/splits_70_15_15/split_indices.npz"
   },
   "model": {
     "img_size": 200,

@@ -6,6 +6,47 @@ hyperparameters, training details) are not listed here.
 
 ---
 
+## 0729_meangate  *(scripts/new_enscgp_swin.py + scripts/new_enscgp_swin_config.json)*
+
+**Logs / checkpoints:** `runs/0729_meangate/` — the current default `log_dir`, and the model
+behind the results table in `README.md`.
+
+An **ablation**, not a redesign: it restores exactly one of the five-plus things v7/0729
+removed at once, to find out which of them cost the accuracy. A real 0729 run (batch_size 4,
+no `mean_gate`) came out measurably worse than 0714 on every metric — val loss, coverage,
+and each component loss — but v7 had bundled both gate removals, the EnsCGP-sigma offset
+seeding removal, the residual-input-decomposition removal, and two extreme-weighting
+rewrites into one change, so nothing could be attributed.
+
+### Breaking change from 0729
+
+- **`mean_gate` restored.** `mean_head`'s final conv goes back to full-strength
+  Kaiming-normal init gated by a learnable scalar (`residual_gate_init`, default 0.1):
+  `q50 = mean_base + mean_gate * mean_head(feats)` — precisely the v0629–0714 design, and a
+  revert of the near-zero-init (`MEAN_HEAD_INIT_STD`) scheme 0729 replaced it with. Breaking
+  in the strict-load sense only because the checkpoint gains one scalar entry: **2,087,059
+  parameters** (0729's 2,087,058 plus the restored gate). A 0729 checkpoint loads into this
+  class with `--resume-weights-only`, which simply leaves `mean_gate` at its init.
+- **Deliberately NOT restored:** `offset_gate`, the offset head's EnsCGP-Cholesky seeding,
+  and the residual input decomposition all stay removed as v7 left them, as does the
+  sign-aware extreme weighting. That is what makes this an ablation of `mean_gate` alone.
+
+### Non-breaking (config)
+
+`batch_size` 4 → 8 (16 alone OOMs an 80GB A100; memory runs ~6.55 GB/sample forward+backward),
+`early_stop_patience` 8 → 50, `lr_milestone_fractions` `[0.5, 0.75, 0.9]` →
+`[0.25, 0.4, 0.6, 0.8]`, and `log_dir` retargeted to `runs/0729_meangate/`.
+
+### Result
+
+Not a clean win, and recorded as such: on the held-out test split, v6-0714 is still ahead on
+bulk CRPS/MAE while this model leads on several extreme-stratum metrics. The paired-bootstrap
+head-to-head is in `runs/0729_meangate/figures/scorecard/scorecard_test.csv`
+(`extra_scripts/swin/oneoff/eval_model_scorecard.py`). The trade is unsettled — treat the
+`mean_gate` question as narrowed, not answered.
+
+---
+
 ## 0729  *(scripts/new_enscgp_swin.py + scripts/train_new_enscgp_swin.py + scripts/multiscale_loss.py)*
 
 **Logs / checkpoints:** `runs/0729/`

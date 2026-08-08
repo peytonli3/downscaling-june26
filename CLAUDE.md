@@ -28,14 +28,18 @@ description against current code/CHANGELOG rather than trusting a stale summary)
 Scripts with meaningful logic end in a smoke test / self-test guarded by
 `if __name__ == "__main__"`, and `tests/` runs them as a set:
 ```
-python tests/test_selftests.py          # all of them (pytest is NOT installed; stdlib only)
+python tests/test_selftests.py          # all of them (no pytest needed; stdlib only)
 python tests/test_selftests.py --fast   # skip the ones that build a real model
+pytest -q                               # same tests, if pytest is available (see pytest.ini)
 python scripts/new_enscgp_swin.py       # model smoke test + pinball-quantile-recovery unit test
 python scripts/multiscale_loss.py       # loss self-test (band decomposition, shift-tolerance)
 python scripts/quantile_metrics.py      # pinball/CRPS numpy-vs-torch agreement, rank_cdf
 ```
-`tests/test_selftests.py` is also a valid pytest module if you install pytest. A new
-self-test should be registered there -- one nothing runs is documentation, not a test.
+`tests/test_selftests.py` runs standalone on the stdlib, and is also a valid pytest
+module (`pytest.ini` sets `testpaths` and the `slow` marker). pytest is NOT in
+`environment.yml` -- the standalone runner is the guaranteed path; `pytest -q` is a
+convenience where it happens to be installed. A new self-test should be registered
+there -- one nothing runs is documentation, not a test.
 
 ### Train
 ```

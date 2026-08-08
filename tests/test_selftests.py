@@ -10,8 +10,10 @@ Run it with no dependencies beyond the conda env you already have::
     python tests/test_selftests.py --fast     # skip the ones that build a real model
     python tests/test_selftests.py -k quantile
 
-pytest is NOT required (it is not currently installed in the project env). If you do install
-it, this file is a valid pytest module too and `pytest tests/` picks up the same functions.
+pytest is NOT required, and is deliberately absent from `environment.yml` -- the invocations
+above need nothing beyond the stdlib. Where pytest IS installed, this file is a valid pytest
+module too and `pytest -q` picks up the same functions (see `pytest.ini` for `testpaths` and
+the `slow` marker).
 
 These are synthetic-data tests: no checkpoint, no GPU, no data/ tree required. The
 diagnostics that need a real checkpoint (extra_scripts/swin/oneoff/) are deliberately NOT

@@ -37,7 +37,7 @@ Heads -- two different residual styles, chosen per head's role:
   mean_base + mean_gate * head(feats), where mean_base is selected by
   residual_base ("enscgp" (default) -> EnsCGP posterior mean, "bicubic" ->
   bicubic baseline, "none" -> zero). RESTORED (post-0729 ablation, see
-  CHANGELOG): the head's final conv is back to full-strength Kaiming-normal
+  CHANGELOG "0729_meangate"): the head's final conv is back to full-strength Kaiming-normal
   init, gated by a learnable scalar mean_gate (init 0.1) -- the v0629-v0714
   design. v7/0729 had switched this to a near-zero-init head with no gate,
   reasoning that mean_gate settling at ~0.125 after a full 0714 run (barely
@@ -83,7 +83,7 @@ new_enscgp_swin_config.json). in_chans is not configurable: it's INPUT_CHANNELS 
 terrain encoder's actual output channels.
 
 NOTE: this is a checkpoint-incompatible change from the 0714 quantile version (see
-CHANGELOG "0729" and the mean_gate-restoration ablation entry that follows it):
+CHANGELOG "0729" and the mean_gate-restoration entry "0729_meangate" above it):
 offset_gate is gone and the offset head no longer reads the EnsCGP Cholesky as a
 seed; mean_gate is back (restored post-0729). mean_head/offset_head/backbone/
 terrain_encoder weights still transfer from a 0714 checkpoint by shape via
