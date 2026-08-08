@@ -2,6 +2,30 @@
 # Swin2SR: Swin2SR: SwinV2 Transformer for Compressed Image Super-Resolution and Restoration, https://arxiv.org/abs/2209.11345
 # Written by Conde and Choi et al.
 # -----------------------------------------------------------------------------------
+#
+# THIRD-PARTY FILE -- NOT covered by this repository's MIT LICENSE.
+#
+# Vendored verbatim from https://github.com/mv-lab/swin2sr (models/network_swin2sr.py)
+# by Marcos V. Conde, Ui-Jin Choi, Maxime Burchi and Radu Timofte. This comment block
+# is the only local change; everything below it is byte-for-byte upstream. This
+# project's own modifications live in scripts/new_enscgp_swin.py, which SUBCLASSES
+# Swin2SR rather than editing it -- keep it that way, so this file stays a clean
+# vendored copy that can still be diffed against upstream.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Full licence text: licenses/Apache-2.0.txt     Details: THIRD_PARTY_NOTICES.md
+# -----------------------------------------------------------------------------------
 
 import math
 import numpy as np

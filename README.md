@@ -152,3 +152,30 @@ git show archive/pre-reorg-snapshots:scripts/0626_v1/new_enscgp_swin.py
 ```
 
 Their binaries live outside the repo in `../26.6_wind_archive/`.
+
+## Credits and licence
+
+This project's own code is MIT-licensed (`LICENSE`). It stands on two pieces of
+prior work:
+
+**Swin2SR** — the transformer backbone, redistributed here verbatim as
+`scripts/network_swin2sr.py` under the **Apache License 2.0** (`licenses/Apache-2.0.txt`).
+This project subclasses it rather than modifying it; the quantile heads and terrain
+input are in `scripts/new_enscgp_swin.py`.
+
+```bibtex
+@inproceedings{conde2022swin2sr,
+  title={{S}win2{SR}: SwinV2 Transformer for Compressed Image Super-Resolution and Restoration},
+  author={Conde, Marcos V and Choi, Ui-Jin and Burchi, Maxime and Timofte, Radu},
+  booktitle={Proceedings of the European Conference on Computer Vision (ECCV) Workshops},
+  year={2022}
+}
+```
+
+**Ens-CGP** — the ensemble-conditional Gaussian process first guess, following the
+method of Ravela et al. (https://arxiv.org/abs/2602.13871). `scripts/enscgp_train.py`
+is an independent implementation written for this project; no code from the authors'
+reference implementation is redistributed here.
+
+`THIRD_PARTY_NOTICES.md` has the full attribution list, including Swin2SR's own
+upstream credits (Swin Transformer, SwinIR, KAIR, BasicSR).
