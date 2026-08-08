@@ -402,7 +402,7 @@ def main() -> None:
         if n_val > 0:
             logs.append(log)
         else:
-            print(f"    (skipped — no val loss entries; is this a pre-0714 log?)")
+            print("    (skipped — no val loss entries; is this a pre-0714 log?)")
 
     if not logs:
         print("No usable log data found.")

@@ -53,7 +53,6 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 
 REPO = next(p for p in Path(__file__).resolve().parents
             if (p / "scripts" / "paths.py").is_file())

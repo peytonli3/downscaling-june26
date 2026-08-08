@@ -21,7 +21,7 @@ from pathlib import Path
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
-from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+from pptx.enum.text import MSO_ANCHOR
 from pptx.util import Inches, Pt
 
 REPO = next(p for p in Path(__file__).resolve().parents

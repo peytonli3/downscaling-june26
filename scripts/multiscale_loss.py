@@ -539,7 +539,7 @@ def _assert_freq_band_pixel_weights() -> None:
     bot_idx = flat_mag.topk(100, largest=False).indices
     assert flat_w[top_idx].mean() < flat_w[bot_idx].mean(), \
         "down_extremes: top-magnitude pixels should have lower weight than bottom-magnitude"
-    print(f"  pixel_weights: mean=1.0 per sample OK; down_extremes direction OK")
+    print("  pixel_weights: mean=1.0 per sample OK; down_extremes direction OK")
 
 
 def _assert_per_band_config_alignment() -> None:

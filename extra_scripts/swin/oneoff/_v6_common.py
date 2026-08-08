@@ -88,7 +88,7 @@ CONFIG = {
 # Safe to import despite the pinned-OLD-architecture juggling above: quantile_metrics
 # imports nothing from this repo (only numpy/torch), so it cannot drag the CURRENT model
 # class in behind it -- which is the specific hazard the sys.path ordering guards against.
-from quantile_metrics import (  # noqa: E402  (re-exported)
+from quantile_metrics import (  # noqa: E402,F401  (re-exported for the diagnostics; see CLAUDE.md "quantile_metrics")
     CRPS_TAUS, CRPS_WEIGHTS, crps_3q, pinball,
 )
 

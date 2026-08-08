@@ -218,7 +218,7 @@ def _assert_fourier_parseval(n_levels: int, base_sigma: float) -> None:
         f"Fourier energy (Parseval, weighted rfft) does not match spatial SSD: "
         f"{fourier_energy} vs {spatial_mse_sum}"
     )
-    print(f"  Fourier Parseval identity (weighted rfft): matches spatial SSD to rtol=1e-6 OK")
+    print("  Fourier Parseval identity (weighted rfft): matches spatial SSD to rtol=1e-6 OK")
 
 
 # --------------------------------------------------------------------------------------
@@ -500,7 +500,7 @@ def plot_shift_quivers(rows: list[dict], n_levels: int, path: Path) -> None:
         dx = row["shift_dx_km_all"].numpy()
         dy = row["shift_dy_km_all"].numpy()
         # subsample for a legible quiver overlay on top of the 2D density
-        h = ax.hist2d(dx, dy, bins=40, cmap="viridis")
+        ax.hist2d(dx, dy, bins=40, cmap="viridis")
         n_show = min(300, len(dx))
         rng = np.random.default_rng(0)
         pick = rng.choice(len(dx), size=n_show, replace=False)

@@ -66,7 +66,7 @@ REPO = next(p for p in Path(__file__).resolve().parents
 sys.path.insert(0, str(REPO / "scripts"))
 
 import _v6_common as common  # noqa: E402  (sibling; pins OLD_ARCH_DIR ahead of scripts/)
-from multiscale_loss import FreqBandLoss, band_sigmas, gaussian_blur, load_or_compute_sigma_band  # noqa: E402
+from multiscale_loss import FreqBandLoss, gaussian_blur, load_or_compute_sigma_band  # noqa: E402
 from multiscale_loss import sliced_wasserstein_patches  # noqa: E402
 
 DATA_DIR = common.DATA_DIR
@@ -521,7 +521,7 @@ def write_findings(path: Path, part3_finding: str, part3_src: str, sigma_report:
                          "inconsistent with a pure sqrt(2) placeability effect; something else "
                          "may be in play at the largest scales.")
         lines.append("")
-        lines.append(f"  Per-band (finest->coarsest), freq_l1 bicubic vs swin_q50, diff=bicubic-swin (95% CI):")
+        lines.append("  Per-band (finest->coarsest), freq_l1 bicubic vs swin_q50, diff=bicubic-swin (95% CI):")
         for b, m_bic, m_swin, diff, lo, hi in info["per_band"]:
             # diff = bic - swin; bicubic wins when diff < 0 with the whole CI below zero.
             sig = "bicubic wins" if (diff < 0 and hi < 0) else ("swin wins" if (diff > 0 and lo > 0) else "ns")
@@ -633,7 +633,7 @@ def write_findings(path: Path, part3_finding: str, part3_src: str, sigma_report:
                      f"best-blur={best_blur:.4f} -> prefers {prefers}")
     lines.append("")
     if freq_l1_prefers_blur:
-        lines.append(f"**freq_l1 prefers blur over displacement at**: " +
+        lines.append("**freq_l1 prefers blur over displacement at**: " +
                      ", ".join(f"band {b} ({lab}, {comp})" for b, lab, comp in freq_l1_prefers_blur))
         lines.append("This confirms the metric-level property directly (independent of the model): "
                      "at these bands, freq_l1 rewards attenuating the signal over placing it "

@@ -46,13 +46,13 @@ REPO = next(p for p in Path(__file__).resolve().parents
             if (p / "scripts" / "paths.py").is_file())
 sys.path.insert(0, str(REPO / "scripts"))
 
-from paths import RUNS_DIR, figures_dir, resolve as resolve_path  # noqa: E402  (re-exported)
+from paths import RUNS_DIR, figures_dir, resolve as resolve_path  # noqa: E402,F401  (re-exported for the diagnostics; see CLAUDE.md "quantile_metrics")
 from new_enscgp_swin import (  # noqa: E402
     DEFAULT_CONFIG_PATH, ProbabilisticSwin2SR, build_model, load_config,
 )
 # The pinball/CRPS definitions are shared with the training loss itself -- see
 # scripts/quantile_metrics.py. Re-exported here so a diagnostic needs one import.
-from quantile_metrics import (  # noqa: E402  (re-exported)
+from quantile_metrics import (  # noqa: E402,F401  (re-exported for the diagnostics; see CLAUDE.md "quantile_metrics")
     CRPS_TAUS, CRPS_WEIGHTS, crps_3q, crps_from_pinball, pinball,
 )
 from terrain_encoder import load_terrain_input  # noqa: E402

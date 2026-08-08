@@ -53,13 +53,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
-import torch
 
 
 from _common import (  # noqa: E402  (shared harness; also puts scripts/ on sys.path)
