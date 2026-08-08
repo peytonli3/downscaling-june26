@@ -43,7 +43,7 @@ from _v6_common import (
     COMPONENTS, DATA_DIR, OUTPUT_DIR, RUNS_DIR, bh_fdr_mask, coastline_distance,
     compute_event_bias, compute_event_predictions, crps_3q, event_stats,
     load_elevation_200, load_event_split_map, load_land_mask, load_model, load_terrain,
-    pinball, plot_diverging,
+    plot_diverging,
 )
 import eval_model_scorecard as scorecard  # v7 loader used by the meangate variant
 
@@ -696,7 +696,8 @@ def run_part_d():
 
 def run_part_a_meangate():
     device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")  # idle GPU as of this run
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = OUT_DIR_MEANGATE  # this part writes beside 0729_meangate, not OUTPUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     model, slices, ckpt = scorecard.build_and_load("v7-meangate", device)
     print(f"Checkpoint: {scorecard.MODELS['v7-meangate']['checkpoint']} "
@@ -707,8 +708,8 @@ def run_part_a_meangate():
     terrain_raw = scorecard.common.load_terrain(device)
     split_map = load_event_split_map()
 
-    val = run_split(model, device, terrain_raw, split_map, "val", OUT_DIR)
-    test = run_split(model, device, terrain_raw, split_map, "test", OUT_DIR)
+    val = run_split(model, device, terrain_raw, split_map, "val", out_dir)
+    test = run_split(model, device, terrain_raw, split_map, "test", out_dir)
 
     land_mask = load_land_mask()
 
@@ -722,9 +723,9 @@ def run_part_a_meangate():
                 f"0729_meangate checkpoint (epoch {ckpt.get('epoch')}, IN PROGRESS)\n"
                 "limits = per-panel 99th percentile of |bias|", fontsize=12)
     plt.tight_layout()
-    fig.savefig(str(OUT_DIR / "static_bias_maps.png"), dpi=150, bbox_inches="tight")
+    fig.savefig(str(out_dir / "static_bias_maps.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"\nSaved {OUT_DIR / 'static_bias_maps.png'}")
+    print(f"\nSaved {out_dir / 'static_bias_maps.png'}")
 
     fig, axes = plt.subplots(len(COMPONENTS), 2, figsize=(9.5, 4.4 * len(COMPONENTS)), squeeze=False)
     for c, comp in enumerate(COMPONENTS):
@@ -738,9 +739,9 @@ def run_part_a_meangate():
     fig.suptitle("Pixels where the static bias is significant at BH-FDR q=0.05 -- 0729_meangate\n"
                 "(two-sided t-test on event-level bias, df = n_events - 1)", fontsize=12)
     plt.tight_layout()
-    fig.savefig(str(OUT_DIR / "significance_masks.png"), dpi=150, bbox_inches="tight")
+    fig.savefig(str(out_dir / "significance_masks.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved {OUT_DIR / 'significance_masks.png'}")
+    print(f"Saved {out_dir / 'significance_masks.png'}")
 
     print("\nDone with Part A (0729_meangate).")
 

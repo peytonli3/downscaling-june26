@@ -94,7 +94,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
-    x = load_terrain_input(data_dir).unsqueeze(0)  # (1, 4, 1000, 1000)
+    x = load_terrain_input(DATA_DIR).unsqueeze(0)  # (1, 4, 1000, 1000)
     model = TerrainEncoder()
     with torch.no_grad():
         out = model(x)
