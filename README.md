@@ -158,10 +158,10 @@ git tag vN-<date>
 Not every experimental change is tagged — check `git log --oneline` too.
 
 - `v7-0729` is the newest tag, but it is **not** the tip: the tip carries the
-  `0729_meangate` ablation (restores `mean_gate`, so its checkpoints are
-  incompatible with `v7-0729`'s) and is not yet tagged. `runs/0729_meangate/` is
-  the current `log_dir` and the source of the results above — see
-  `docs/CHANGELOG.md`.
+  `0729_meangate` ablation (commit `a2d37ad`, which restores `mean_gate`, so its
+  checkpoints are incompatible with `v7-0729`'s) and is not yet tagged.
+  `runs/0729_meangate/` is the current `log_dir` and the source of the results
+  above — see the `0729_meangate` entry in `docs/CHANGELOG.md`.
 - `archive/pre-reorg-snapshots` holds the original tree including the `0626_v1`
   and `0628_v2` snapshot dirs. Read without checking out:
   `git show archive/pre-reorg-snapshots:scripts/0626_v1/new_enscgp_swin.py`
