@@ -24,7 +24,7 @@ on identical pixels drawn from the WRF truth.
 | ERA5 bicubic | 1.847 / 1.904 | 2.868 / 2.961 | 3.569 / 3.696 | 5.131 / 5.684 |
 | EnsCGP posterior mean | 1.804 / 1.863 | 2.697 / 2.786 | 3.762 / 4.088 | 5.056 / 5.586 |
 | EnsCGP/bicubic blend (α=0.5) | **1.678 / 1.732** | **2.602 / 2.677** | 3.539 / 3.751 | 4.909 / 5.388 |
-| **This model (q50)** | 1.678 / 1.746** | 2.611 / 2.792 | **3.262 / 3.540** | **4.586 / 5.367** |
+| **This model (q50)** | 1.678 / 1.746 | 2.611 / 2.792 | **3.262 / 3.540** | **4.586 / 5.367** |
 
 Every number above is aggregated at the **event** level — the metric is reduced
 within a storm first, then averaged unweighted over storms — because samples
