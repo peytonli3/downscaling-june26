@@ -53,7 +53,8 @@ from new_enscgp_swin import (  # noqa: E402
 # The pinball/CRPS definitions are shared with the training loss itself -- see
 # scripts/quantile_metrics.py. Re-exported here so a diagnostic needs one import.
 from quantile_metrics import (  # noqa: E402,F401  (re-exported for the diagnostics; see CLAUDE.md "quantile_metrics")
-    CRPS_TAUS, CRPS_WEIGHTS, crps_3q, crps_from_pinball, pinball,
+    CRPS_TAUS, CRPS_WEIGHTS, crps_3q, crps_from_pinball, masked_mean, pinball,
+    stratified_error, top_speed_frac_to_pct, top_speed_mask, wind_speed,
 )
 from terrain_encoder import load_terrain_input  # noqa: E402
 
@@ -68,6 +69,13 @@ ARRAY_FILES = {
     "era5": "era5_uv_2ch_native34.npy",        # native 34x34 ERA5, for LR panels
 }
 LAND_MASK_FILE = "land_mask_hires.npz"
+
+# The config these diagnostics default to: the REPORTED model (v6-0714), not whatever the
+# training config currently points at. Running any eval here with no arguments should
+# reproduce the README, and the training config's log_dir moves whenever a new run starts.
+# Override with --config to look at a different run.
+REPORTED_CONFIG_PATH = RUNS_DIR / "0714" / "config.json"
+EVAL_CONFIG_PATH = REPORTED_CONFIG_PATH if REPORTED_CONFIG_PATH.is_file() else DEFAULT_CONFIG_PATH
 
 
 # --------------------------------------------------------------------------------------
@@ -126,14 +134,72 @@ def resolve_paths(args, config: dict) -> tuple[Path, Path, Path, Path]:
     return Path(data_dir), Path(log_dir), Path(splits_path), Path(checkpoint)
 
 
-def load_model(config: dict, checkpoint: Path, device) -> tuple[torch.nn.Module, dict]:
-    """Build the architecture from `config`, load `checkpoint`'s weights into it, and hand
-    back the raw checkpoint dict too (every caller reports its epoch / best_val_loss)."""
-    model = build_model(config).to(device)
+# --------------------------------------------------------------------------------------
+# Architecture dispatch
+# --------------------------------------------------------------------------------------
+# The reported model (0714) is the v6 architecture, which differs from the current class by
+# exactly one tensor -- `offset_gate`, the gate on the old EnsCGP-Cholesky-seeded offset head
+# (277 of 278 tensors are shared and same-shape). That one key is therefore a reliable
+# discriminator, and it is what these diagnostics detect so a 0714 checkpoint "just works"
+# instead of dying on `Unexpected key(s) in state_dict`.
+#
+# The v6 class is the pinned copy under oneoff/_v6_0714_arch/, loaded through importlib under
+# its OWN module name so it can never collide with the current `new_enscgp_swin` already in
+# sys.modules. (This is the same trick eval_model_scorecard.py uses in the other direction;
+# it is strictly safer than the sys.path reordering in _v6_common.py, which can only bind one
+# of the two at a time.) Its `from network_swin2sr import ...` resolves via scripts/, which is
+# correct: both files are unchanged since v6-0714.
+V6_ARCH_DIR = REPO / "extra_scripts" / "swin" / "oneoff" / "_v6_0714_arch"
+V6_MARKER_KEY = "offset_gate"
+ARCHITECTURES = ("current", "v6")
+_ARCH_CACHE: dict = {}
+
+
+def detect_architecture(state_dict) -> str:
+    """'v6' or 'current', from the checkpoint's own tensor names."""
+    return "v6" if V6_MARKER_KEY in state_dict else "current"
+
+
+def load_architecture(arch: str):
+    """The module providing `ProbabilisticSwin2SR` / `build_model` for `arch`."""
+    if arch not in ARCHITECTURES:
+        raise ValueError(f"arch must be one of {ARCHITECTURES}, got {arch!r}")
+    if arch == "current":
+        import new_enscgp_swin
+        return new_enscgp_swin
+    if arch not in _ARCH_CACHE:
+        import importlib.util
+        path = V6_ARCH_DIR / "new_enscgp_swin.py"
+        if not path.is_file():
+            raise RuntimeError(
+                f"pinned v6 model class not found at {path}. Without it a 0714 checkpoint "
+                "cannot be interpreted. Restore it with:\n"
+                f"  git show v6-0714:scripts/new_enscgp_swin.py > {path}"
+            )
+        spec = importlib.util.spec_from_file_location("_arch_v6_new_enscgp_swin", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        _ARCH_CACHE[arch] = mod
+    return _ARCH_CACHE[arch]
+
+
+def load_model(config: dict, checkpoint: Path, device,
+               arch: str | None = None) -> tuple[torch.nn.Module, dict, str]:
+    """Build the right architecture for `checkpoint`, load its weights, and hand back
+    (model, raw checkpoint dict, arch name).
+
+    `arch` defaults to autodetection from the checkpoint itself. The load stays STRICT: a
+    checkpoint that does not match its detected architecture must fail loudly, since a
+    silently partial load is the failure mode this whole dispatch exists to prevent.
+    """
     ckpt = torch.load(checkpoint, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    state = ckpt["model_state_dict"]
+    arch = arch or detect_architecture(state)
+    model = load_architecture(arch).build_model(config).to(device)
+    model.load_state_dict(state)
     model.eval()
-    return model, ckpt
+    return model, ckpt, arch
 
 
 def load_terrain(data_dir: Path, device) -> torch.Tensor:
@@ -272,8 +338,9 @@ def add_eval_args(p: argparse.ArgumentParser, *, samples: str | None = "draw",
       None   -> no selection flags (the script evaluates something fixed)
     `arrays` adds the per-array path overrides consumed by `setup()`.
     """
-    p.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH,
-                   help="new_enscgp_swin_config.json (architecture + default paths)")
+    p.add_argument("--config", type=Path, default=EVAL_CONFIG_PATH,
+                   help=f"Run config (architecture + default paths). Defaults to the REPORTED "
+                        f"model, {EVAL_CONFIG_PATH.name} under {EVAL_CONFIG_PATH.parent.name}/")
     p.add_argument("--checkpoint", type=Path, default=None,
                    help="Defaults to <log_dir>/checkpoints/best.pth from --config")
     p.add_argument("--data_dir", type=Path, default=None, help="Defaults to paths.data_dir from --config")
@@ -281,6 +348,8 @@ def add_eval_args(p: argparse.ArgumentParser, *, samples: str | None = "draw",
     p.add_argument("--split", type=str, default="test", choices=["train", "val", "test"],
                    help="Sample pool for default selection")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--arch", type=str, default=None, choices=list(ARCHITECTURES),
+                   help="Model architecture. Default: autodetected from the checkpoint")
     if arrays:
         for name, filename in ARRAY_FILES.items():
             p.add_argument(f"--{name}_path", type=Path, default=None,
@@ -315,13 +384,14 @@ class EvalSetup:
     ckpt: dict
     terrain_raw: torch.Tensor
     arrays: EvalArrays
+    arch: str = "current"
 
     def figure_path(self, name: str) -> Path:
         """<log_dir>/figures/<name> -- the one output convention (see paths.figures_dir)."""
         return figures_dir(self.log_dir) / name
 
     def describe_checkpoint(self) -> str:
-        return (f"{self.checkpoint} (epoch {self.ckpt.get('epoch')}, "
+        return (f"{self.checkpoint} (arch {self.arch}, epoch {self.ckpt.get('epoch')}, "
                 f"best_val_loss {self.ckpt.get('best_val_loss')})")
 
 
@@ -334,11 +404,12 @@ def setup(args) -> EvalSetup:
     config = load_config(args.config)
     data_dir, log_dir, splits_path, checkpoint = resolve_paths(args, config)
     device = torch.device(args.device)
-    model, ckpt = load_model(config, checkpoint, device)
+    model, ckpt, arch = load_model(config, checkpoint, device,
+                                   arch=getattr(args, "arch", None))
     terrain_raw = load_terrain(data_dir, device)
     overrides = {name: getattr(args, f"{name}_path", None) for name in ARRAY_FILES}
     overrides["land_mask"] = getattr(args, "hires_land_mask_path", None)
     arrays = EvalArrays(data_dir, **overrides)
     return EvalSetup(config=config, data_dir=data_dir, log_dir=log_dir, splits_path=splits_path,
                      checkpoint=checkpoint, device=device, model=model, ckpt=ckpt,
-                     terrain_raw=terrain_raw, arrays=arrays)
+                     terrain_raw=terrain_raw, arrays=arrays, arch=arch)

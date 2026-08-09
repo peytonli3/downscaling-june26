@@ -21,7 +21,6 @@ Parts A-D operates on the event axis of that array, not on raw samples or pixels
 """
 from __future__ import annotations
 
-import csv
 import sys
 from pathlib import Path
 
@@ -38,6 +37,7 @@ OLD_ARCH_DIR = Path(__file__).resolve().parent / "_v6_0714_arch"
 sys.path.insert(0, str(CUR_SCRIPTS))  # provisional, just to reach paths.py; re-ordered below
 
 from paths import DATA_DIR, RUNS_DIR  # noqa: E402
+from events import load_event_split_map as _load_event_split_map  # noqa: E402
 
 CHECKPOINT = RUNS_DIR / "0714/checkpoints/best.pth"
 SPLITS_PATH = DATA_DIR / "splits_70_15_15/split_indices.npz"
@@ -106,12 +106,9 @@ def load_terrain(device):
 
 
 def load_event_split_map() -> dict[str, dict[int, list[int]]]:
-    """split -> {event_id: [sample_index, ...]}, from data/sample_event_ids.csv."""
-    m = {"train": {}, "val": {}, "test": {}}
-    with open(DATA_DIR / "sample_event_ids.csv") as f:
-        for row in csv.DictReader(f):
-            m[row["split"]].setdefault(int(row["event_id"]), []).append(int(row["sample_index"]))
-    return m
+    """split -> {event_id: [sample_index, ...]}. Thin bind of scripts/events.py to DATA_DIR;
+    shared with the current-architecture diagnostics so both read events the same way."""
+    return _load_event_split_map(DATA_DIR)
 
 
 def load_land_mask() -> np.ndarray:

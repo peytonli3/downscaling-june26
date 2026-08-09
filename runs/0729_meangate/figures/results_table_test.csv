@@ -1,0 +1,49 @@
+predictor,metric,stratum,component,value
+ERA5 bicubic,mae,all,u,1.847120
+ERA5 bicubic,mae,all,v,1.903636
+ERA5 bicubic,mae,top10,u,3.207297
+ERA5 bicubic,mae,top10,v,3.220119
+ERA5 bicubic,mae,top5,u,3.569400
+ERA5 bicubic,mae,top5,v,3.695620
+ERA5 bicubic,rmse,all,u,2.867657
+ERA5 bicubic,rmse,all,v,2.961152
+ERA5 bicubic,rmse,top10,u,4.713124
+ERA5 bicubic,rmse,top10,v,4.948944
+ERA5 bicubic,rmse,top5,u,5.130662
+ERA5 bicubic,rmse,top5,v,5.683947
+EnsCGP posterior mean,mae,all,u,1.804270
+EnsCGP posterior mean,mae,all,v,1.863192
+EnsCGP posterior mean,mae,top10,u,3.363430
+EnsCGP posterior mean,mae,top10,v,3.512486
+EnsCGP posterior mean,mae,top5,u,3.761954
+EnsCGP posterior mean,mae,top5,v,4.088377
+EnsCGP posterior mean,rmse,all,u,2.697262
+EnsCGP posterior mean,rmse,all,v,2.785917
+EnsCGP posterior mean,rmse,top10,u,4.605645
+EnsCGP posterior mean,rmse,top10,v,4.861944
+EnsCGP posterior mean,rmse,top5,u,5.056025
+EnsCGP posterior mean,rmse,top5,v,5.585977
+EnsCGP/bicubic blend (a=0.5),mae,all,u,1.677571
+EnsCGP/bicubic blend (a=0.5),mae,all,v,1.732239
+EnsCGP/bicubic blend (a=0.5),mae,top10,u,3.160204
+EnsCGP/bicubic blend (a=0.5),mae,top10,v,3.224955
+EnsCGP/bicubic blend (a=0.5),mae,top5,u,3.538787
+EnsCGP/bicubic blend (a=0.5),mae,top5,v,3.751319
+EnsCGP/bicubic blend (a=0.5),rmse,all,u,2.602217
+EnsCGP/bicubic blend (a=0.5),rmse,all,v,2.676604
+EnsCGP/bicubic blend (a=0.5),rmse,top10,u,4.482972
+EnsCGP/bicubic blend (a=0.5),rmse,top10,v,4.675392
+EnsCGP/bicubic blend (a=0.5),rmse,top5,u,4.909383
+EnsCGP/bicubic blend (a=0.5),rmse,top5,v,5.388221
+This model (q50),mae,all,u,1.723150
+This model (q50),mae,all,v,1.818748
+This model (q50),mae,top10,u,2.914133
+This model (q50),mae,top10,v,3.075340
+This model (q50),mae,top5,u,3.215471
+This model (q50),mae,top5,v,3.517468
+This model (q50),rmse,all,u,2.670011
+This model (q50),rmse,all,v,2.874732
+This model (q50),rmse,top10,u,4.242258
+This model (q50),rmse,top10,v,4.767768
+This model (q50),rmse,top5,u,4.593651
+This model (q50),rmse,top5,v,5.458017

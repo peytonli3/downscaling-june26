@@ -1,0 +1,24 @@
+{
+  "COMMENT": "Config for the REPORTED model, v6-0714 -- the run behind the README results table. The eval scripts under extra_scripts/swin/ default to this file, so they evaluate the reported model with no arguments. Training keeps its own config at scripts/new_enscgp_swin_config.json; do NOT point training at this file, because its log_dir is this run's directory and a new run would overwrite these checkpoints. The 'model' section is the v6 architecture, confirmed from this run's own training log (runs/0714/train_*.log); scripts/new_enscgp_swin.py can no longer build it (v6 has offset_gate, which the current class dropped), so the eval harness autodetects the architecture from the checkpoint and loads the pinned class from extra_scripts/swin/oneoff/_v6_0714_arch/.",
+  "seed": 0,
+  "paths": {
+    "data_dir": "data",
+    "log_dir": "runs/0714",
+    "splits_path": "data/splits_70_15_15/split_indices.npz"
+  },
+  "model": {
+    "img_size": 200,
+    "embed_dim": 96,
+    "depths": [4, 4, 4],
+    "num_heads": [6, 6, 6],
+    "window_size": 8,
+    "mlp_ratio": 4.0,
+    "residual_base": "bicubic",
+    "residual_gate_init": 0.1,
+    "init_spread_scale": 1.28,
+    "drop_rate": 0.05,
+    "attn_drop_rate": 0.05,
+    "drop_path_rate": 0.1,
+    "head_dropout": 0.15
+  }
+}

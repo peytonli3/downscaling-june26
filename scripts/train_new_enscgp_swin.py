@@ -99,7 +99,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from new_enscgp_swin import DEFAULT_CONFIG_PATH, ProbabilisticSwin2SR, build_model, load_config
 from paths import resolve as resolve_path
-from quantile_metrics import CRPS_TAUS, crps_from_pinball, pinball, rank_cdf
+from quantile_metrics import CRPS_TAUS, crps_from_pinball, pinball, rank_cdf, top_speed_mask
 from terrain_encoder import load_terrain_input
 from multiscale_loss import DEFAULT_METRIC_PER_BAND, METRIC_SCALE, FreqBandLoss, MultiscaleLoss, load_or_compute_sigma_band
 
@@ -363,22 +363,24 @@ SELECTION_METRICS = ("crps", "l1", "total")
 # 90th percentile) -- the damage-relevant region where q90 must actually reach the peaks.
 COVERAGE_KEYS = ("cov_q10", "cov_q50", "cov_q90", "cov_q10_ext", "cov_q50_ext", "cov_q90_ext")
 NOMINAL_COVERAGE = {"cov_q10": 0.10, "cov_q50": 0.50, "cov_q90": 0.90}
+# The "_ext" stratum: the windiest 10% of each sample's pixels by wind speed. One number,
+# here, so the training log and the scorecard's top10 columns mean the same thing.
+EXT_TOP_FRAC = 0.10
 
 
 @torch.no_grad()
-def coverage_metrics(pred: torch.Tensor, target: torch.Tensor, ext_quantile: float = 0.9) -> dict:
+def coverage_metrics(pred: torch.Tensor, target: torch.Tensor, ext_top_frac: float = EXT_TOP_FRAC) -> dict:
     """Empirical coverage: fraction of truth (u,v) pixels <= each predicted quantile, both
-    overall and within the extreme tail (|wind| above its per-sample ext_quantile). A
-    calibrated model has cov_q10~=.10, cov_q50~=.50, cov_q90~=.90. Post-hoc CHECK, not a loss.
+    overall and within the extreme tail (the windiest `ext_top_frac` of each sample's pixels,
+    by wind speed -- see quantile_metrics.top_speed_mask). A calibrated model has
+    cov_q10~=.10, cov_q50~=.50, cov_q90~=.90. Post-hoc CHECK, not a loss.
     Returns per-key (count_below, count_total) so a running total can be aggregated exactly."""
     q10 = pred[:, ProbabilisticSwin2SR.Q10_SLICE]
     q50 = pred[:, ProbabilisticSwin2SR.Q50_SLICE]
     q90 = pred[:, ProbabilisticSwin2SR.Q90_SLICE]
     below = {"cov_q10": (target <= q10), "cov_q50": (target <= q50), "cov_q90": (target <= q90)}
 
-    mag = torch.sqrt(target[:, 0:1] ** 2 + target[:, 1:2] ** 2 + 1e-6)   # (B,1,H,W)
-    thresh = torch.quantile(mag.reshape(mag.shape[0], -1), ext_quantile, dim=1)  # (B,)
-    ext = (mag >= thresh.reshape(-1, 1, 1, 1)).expand_as(q50)             # (B,2,H,W)
+    ext = top_speed_mask(target, ext_top_frac).expand_as(q50)  # (B,2,H,W)
 
     out = {}
     for base, mask in below.items():

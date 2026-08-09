@@ -58,8 +58,16 @@ python train_new_enscgp_swin.py [--config new_enscgp_swin_config.json] [--device
 Under `extra_scripts/swin/`: `eval_checkpoint.py` (panel figures),
 `eval_quantile_calibration.py` (PIT histogram + coverage maps),
 `compare_eigenspectra.py` (spectral fidelity of q50), `eval_pinball_impact.py`.
-Point `--checkpoint` at `runs/<version>/checkpoints/*.pth` (it defaults to
-`<log_dir>/checkpoints/best.pth` from `--config`).
+`--config` defaults to `runs/0714/config.json` -- the REPORTED model (v6-0714),
+so these run with no arguments and reproduce the README. Training keeps its own
+config at `scripts/new_enscgp_swin_config.json`; never point training at the
+run config, whose `log_dir` is an existing run's directory.
+
+0714 is the **v6** architecture and `scripts/new_enscgp_swin.py` cannot build it
+(v6 has `offset_gate`, dropped at v7). The harness handles this: `load_model`
+autodetects the architecture from the checkpoint's own keys and loads the pinned
+v6 class from `swin/oneoff/_v6_0714_arch/` via importlib under its own module
+name. `--arch {current,v6}` overrides the detection. The load stays strict.
 
 They all go through `swin/_common.py`, and a new diagnostic must too:
 ```python
@@ -158,9 +166,9 @@ always computed on validation as a diagnostic (`compute_all` in
 - `data/` -- gitignored; raw-vs-derived classification and regeneration
   commands are in `data/README.md`.
 - `runs/<version>/` -- everything one run produced: `train_*.log` (tracked),
-  `checkpoints/` and `figures/` (gitignored, except figures' `*.csv`). This is
-  the ONLY per-version output location; the old `logs/` + `inference_results/`
-  split is gone.
+  `config.json` (tracked where present), `checkpoints/` and `figures/`
+  (gitignored, except figures' `*.csv`). This is the ONLY per-version output
+  location; the old `logs/` + `inference_results/` split is gone.
 - `../26.6_wind_archive/` -- OUTSIDE the repo, the on-disk graveyard for retired
   binaries; the corresponding code is recoverable via `archive/*` git tags.
 

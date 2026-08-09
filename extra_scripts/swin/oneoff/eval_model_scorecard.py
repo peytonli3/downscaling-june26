@@ -15,10 +15,14 @@ WHAT IT MEASURES (per component, never pooled across u and v)
   Deterministic (q50): mae, rmse, bias
   Probabilistic:       crps (3-quantile approx), pinball_q10/q90 UNWEIGHTED, width (q90-q10)
   Calibration:         cov_q10/q50/q90 -- scored by |coverage - nominal|, not by direction
-  Extreme tail:        the same metrics restricted to pixels where |wind| is at or above its
-                       own per-sample 90th percentile (the exact mask
-                       train_new_enscgp_swin.py::coverage_metrics uses, so *_ext here and
-                       "extreme tail" in the training logs mean the same region).
+  Wind-speed strata:   every metric above, recomputed on the windiest N% of each sample's
+                       pixels by WIND SPEED, for each --top-pcts entry (default 10 and 5),
+                       reported as *_top10 / *_top5. The mask is
+                       quantile_metrics.top_speed_mask -- the same one
+                       train_new_enscgp_swin.py::coverage_metrics uses for its "extreme
+                       tail", so *_top10 here and the training logs mean the same region.
+                       Masks come from the TRUTH, so both models are scored on identical
+                       pixels.
 
 AGGREGATION -- the load-bearing convention
 Samples inside an event are near-duplicates (same storm, consecutive hours), so they are not
@@ -46,6 +50,7 @@ importlib, so the two never collide in sys.modules.
 
 Usage:
     python eval_model_scorecard.py [--split test] [--device cuda:1] [--n-boot 10000]
+    python eval_model_scorecard.py --top-pcts 10 5 1      # extra wind-speed strata
 """
 from __future__ import annotations
 
@@ -62,7 +67,9 @@ REPO = next(p for p in Path(__file__).resolve().parents
             if (p / "scripts" / "paths.py").is_file())
 # Importing this first pins sys.path (OLD_ARCH_DIR ahead of scripts/) and binds the v6 class.
 import _v6_common as common  # noqa: E402  (sibling)
-from quantile_metrics import crps_from_pinball, pinball  # noqa: E402  (shared with the training loss)
+from quantile_metrics import (  # noqa: E402  (shared with the training loss)
+    crps_from_pinball, pinball, top_speed_frac_to_pct, top_speed_mask,
+)
 
 RUNS_DIR = common.RUNS_DIR
 OUTPUT_DIR = RUNS_DIR / "0729_meangate/figures/scorecard"
@@ -96,9 +103,30 @@ MODELS = {
 
 NOMINAL = {"cov_q10": 0.10, "cov_q50": 0.50, "cov_q90": 0.90}
 
-# Accumulator keys. "_ext" twins are added programmatically -- see accumulate().
+# Accumulator keys. Per-stratum twins ("_top10", "_top5", ...) are added programmatically
+# -- see event_metrics().
 BASE_KEYS = ("abs_err", "sq_err", "err", "crps", "pin10", "pin90",
              "cov_q10", "cov_q50", "cov_q90", "width")
+
+# Wind-speed strata reported alongside the all-pixel numbers. Every metric is computed on
+# all pixels AND on the windiest N% of each sample's pixels (quantile_metrics.top_speed_mask)
+# -- "does the model hold up where the wind actually was?" is the question the README's
+# headline MAE cannot answer on its own.
+DEFAULT_TOP_PCTS = (10.0, 5.0)
+STRATUM_ALL = ""
+
+
+def stratum_suffixes(top_pcts) -> list[str]:
+    """['', '_top10', '_top5'] -- the all-pixel stratum first, then one per requested pct."""
+    return [STRATUM_ALL] + [f"_top{top_speed_frac_to_pct(p / 100.0)}" for p in top_pcts]
+
+
+def split_stratum(key: str) -> tuple[str, str]:
+    """'mae_top10' -> ('mae', '_top10'); 'mae' -> ('mae', ''). No BASE_KEY contains '_top',
+    so this partition is unambiguous."""
+    base, sep, tail = key.partition("_top")
+    return (base, sep + tail) if sep else (key, STRATUM_ALL)
+
 
 # (metric, how a DIFFERENCE is judged). "lower": B better if diff < 0. "calib": scored by
 # |value - nominal|, so direction alone is meaningless. "none": diagnostic only, not scored.
@@ -145,35 +173,27 @@ def build_and_load(name: str, device):
     return model, slices, ckpt
 
 
-def extreme_mask(truth: torch.Tensor, ext_quantile: float = 0.9) -> torch.Tensor:
-    """(B,2,H,W) bool. Exactly train_new_enscgp_swin.py::coverage_metrics' definition: pixels
-    where the wind MAGNITUDE is at or above its own per-sample ext_quantile. The mask is
-    shared by u and v (it marks a region of the storm, not a per-component condition); the
-    metrics computed inside it are still strictly per component."""
-    mag = torch.sqrt(truth[:, 0:1] ** 2 + truth[:, 1:2] ** 2 + 1e-6)
-    thresh = torch.quantile(mag.reshape(mag.shape[0], -1), ext_quantile, dim=1)
-    return (mag >= thresh.reshape(-1, 1, 1, 1)).expand_as(truth)
-
-
 @torch.no_grad()
 def event_metrics(model, slices, device, terrain_raw, split_map, split: str,
-                  batch_size: int = 16) -> tuple[np.ndarray, dict]:
+                  batch_size: int = 16, top_pcts=DEFAULT_TOP_PCTS) -> tuple[np.ndarray, dict]:
     """-> (event_ids (E,), {metric_key: (E,2) float64}).
 
     Per event: sum each metric over that event's samples and pixels, then divide by the
-    matching count -> one scalar per (event, component). Counts differ between the full-grid
-    and _ext metrics (and the _ext count varies per sample), so each family carries its own
-    denominator rather than assuming a shared one.
+    matching count -> one scalar per (event, component). Every metric is produced once per
+    stratum (all pixels, then the windiest N% for each entry of `top_pcts`). Each stratum
+    carries its OWN denominator -- a stratum's pixel count varies per sample and is not a
+    fixed fraction of the grid once ties at the threshold are counted -- so counts are
+    accumulated alongside the sums rather than assumed.
     """
     q10_sl, q50_sl, q90_sl = slices
     event_ids = common.select_event_ids(split_map, split)
-    keys = list(BASE_KEYS) + [k + "_ext" for k in BASE_KEYS]
+    suffixes = stratum_suffixes(top_pcts)
     E = len(event_ids)
     # Accumulated on the GPU in float64, one row per event; divided by the matching count
     # once the whole split has been walked.
-    acc = {k: torch.zeros(E, 2, dtype=torch.float64, device=device) for k in keys}
-    n_full = torch.zeros(E, 2, dtype=torch.float64, device=device)
-    n_ext = torch.zeros(E, 2, dtype=torch.float64, device=device)
+    acc = {k + s: torch.zeros(E, 2, dtype=torch.float64, device=device)
+           for k in BASE_KEYS for s in suffixes}
+    counts = {s: torch.zeros(E, 2, dtype=torch.float64, device=device) for s in suffixes}
 
     for ei, _eid, pred, truth in common.iter_event_batches(
             model, device, terrain_raw, split_map, split, batch_size):
@@ -195,18 +215,20 @@ def event_metrics(model, slices, device, terrain_raw, split_map, split: str,
             "cov_q90": (y <= q90).double(),
             "width": q90 - q10,
         }
-        ext = extreme_mask(y)
-        for k, v in per_pixel.items():
-            acc[k][ei] += v.sum(dim=(0, 2, 3))
-            acc[k + "_ext"][ei] += (v * ext).sum(dim=(0, 2, 3))
-        n_full[ei] += float(y.shape[0] * y.shape[2] * y.shape[3])
-        n_ext[ei] += ext.sum(dim=(0, 2, 3)).double()
+        # Masks are built from the TRUTH y, so they are identical for both models being
+        # compared -- the strata are a fixed property of the data, not of a prediction.
+        masks = {STRATUM_ALL: None}
+        for pct, suffix in zip(top_pcts, suffixes[1:]):
+            masks[suffix] = top_speed_mask(y, pct / 100.0).expand_as(y)
 
-    out = {}
-    for k in BASE_KEYS:
-        out[k] = (acc[k] / n_full).cpu().numpy()
-        out[k + "_ext"] = (acc[k + "_ext"] / n_ext.clamp_min(1.0)).cpu().numpy()
-    return event_ids, out
+        for suffix, mask in masks.items():
+            for k, v in per_pixel.items():
+                acc[k + suffix][ei] += (v if mask is None else v * mask).sum(dim=(0, 2, 3))
+            counts[suffix][ei] += (float(y.shape[0] * y.shape[2] * y.shape[3]) if mask is None
+                                   else mask.sum(dim=(0, 2, 3)).double())
+
+    return event_ids, {k + s: (acc[k + s] / counts[s].clamp_min(1.0)).cpu().numpy()
+                       for k in BASE_KEYS for s in suffixes}
 
 
 # Metric name -> the accumulator holding its per-event values. Anything not listed is stored
@@ -218,12 +240,12 @@ def event_vector(per_event: dict, key: str, comp: int) -> np.ndarray:
     """The (E,) per-event values backing one metric, for one component. For rmse this is the
     per-event MSE -- the sqrt is applied AFTER averaging over events (see apply_reduction),
     because sqrt does not commute with the mean."""
-    base, ext = (key[:-4], "_ext") if key.endswith("_ext") else (key, "")
-    return per_event[_SRC.get(base, base) + ext][:, comp]
+    base, suffix = split_stratum(key)
+    return per_event[_SRC.get(base, base) + suffix][:, comp]
 
 
 def apply_reduction(key: str, mean_over_events: np.ndarray | float):
-    return np.sqrt(mean_over_events) if key.replace("_ext", "") == "rmse" else mean_over_events
+    return np.sqrt(mean_over_events) if split_stratum(key)[0] == "rmse" else mean_over_events
 
 
 def paired_bootstrap(a: dict, b: dict, keys: list[str], n_events: int,
@@ -249,14 +271,14 @@ def paired_bootstrap(a: dict, b: dict, keys: list[str], n_events: int,
 def verdict(key: str, va: float, vb: float, lo: float, hi: float, name_a: str, name_b: str) -> str:
     """A call is made only when the 95% CI on the difference excludes 0. Calibration metrics
     are judged on |value - nominal| (closer is better), not on the sign of the difference."""
-    sense = METRIC_SENSE.get(key.replace("_ext", ""), "none")
+    sense = METRIC_SENSE.get(split_stratum(key)[0], "none")
     significant = (lo > 0) or (hi < 0)
     if sense == "none":
         return "--"
     if not significant:
         return "ns"
     if sense == "calib":
-        nominal = NOMINAL[key.replace("_ext", "")]
+        nominal = NOMINAL[split_stratum(key)[0]]
         return name_b if abs(vb - nominal) < abs(va - nominal) else name_a
     return name_b if vb < va else name_a
 
@@ -269,6 +291,10 @@ def main():
     ap.add_argument("--n-boot", type=int, default=10000)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--top-pcts", type=float, nargs="*", default=list(DEFAULT_TOP_PCTS),
+                    metavar="PCT",
+                    help="Wind-speed strata to report alongside the all-pixel numbers: the "
+                         "windiest PCT%% of each sample's pixels. Pass none to disable.")
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -277,6 +303,7 @@ def main():
     n_events = len(split_map[args.split])
     names = list(MODELS.keys())
     print(f"split={args.split}  events={n_events}  device={args.device}  n_boot={args.n_boot}")
+    print(f"strata: all pixels" + "".join(f" + windiest {p:g}%" for p in args.top_pcts))
 
     per_event = {}
     for name in names:
@@ -284,13 +311,14 @@ def main():
         gate = model.mean_gate.item() if hasattr(model, "mean_gate") else float("nan")
         print(f"  {name}: epoch {ckpt['epoch']}, val {ckpt['best_val_loss']:.5f}, mean_gate {gate:.4f}")
         eids, per_event[name] = event_metrics(model, slices, device, terrain_raw,
-                                              split_map, args.split, args.batch_size)
+                                              split_map, args.split, args.batch_size,
+                                              args.top_pcts)
         del model
         torch.cuda.empty_cache()
 
-    keys = ["mae", "rmse", "bias", "crps", "pin10", "pin90", "width",
-            "cov_q10", "cov_q50", "cov_q90"]
-    keys = keys + [k + "_ext" for k in keys]
+    base_metrics = ["mae", "rmse", "bias", "crps", "pin10", "pin90", "width",
+                    "cov_q10", "cov_q50", "cov_q90"]
+    keys = [m + s for s in stratum_suffixes(args.top_pcts) for m in base_metrics]
     res = paired_bootstrap(per_event[names[0]], per_event[names[1]], keys,
                            n_events, args.n_boot, args.seed)
 
@@ -313,7 +341,7 @@ def main():
             print()
 
     # Headline tally over the metrics that have a defined direction.
-    scored = [k for k in keys if METRIC_SENSE.get(k.replace("_ext", ""), "none") != "none"]
+    scored = [k for k in keys if METRIC_SENSE.get(split_stratum(k)[0], "none") != "none"]
     tally = {names[0]: 0, names[1]: 0, "ns": 0}
     for key in scored:
         for comp in (0, 1):

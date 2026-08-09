@@ -16,7 +16,7 @@ Two figures are produced.
         q50 <= truth < q90 : 0.40   truth >= q90 : 0.10
     One panel per component, bars = observed bin frequencies, black steps = the nominal
     rates. Overall bars plus an "extreme tail" series (pixels whose wind magnitude is above
-    that sample's --ext_quantile percentile) show whether calibration that holds in bulk
+    that sample's --ext_top_pct windiest pixels) show whether calibration that holds in bulk
     breaks in the damaging tail. Shape reading: outer bins too tall (U) => intervals too
     narrow / overconfident; inner bins too tall (hump) => intervals too wide. This is the
     quantile-era replacement for the retired Gaussian z-score calibration histogram.
@@ -54,6 +54,7 @@ from matplotlib.colors import TwoSlopeNorm
 from _common import (  # noqa: E402  (shared harness; also puts scripts/ on sys.path)
     COMPONENTS, ProbabilisticSwin2SR, add_eval_args,
     choose_indices_all as choose_indices, iter_predictions, setup, split_pool,
+    top_speed_mask,
 )
 
 QUANTILES = (("q10", 0.10, ProbabilisticSwin2SR.Q10_SLICE),
@@ -77,14 +78,12 @@ class CalibrationAccumulator:
         self.bin_counts = np.zeros((len(COMPONENTS), 4), dtype=np.float64)
         self.bin_counts_ext = np.zeros((len(COMPONENTS), 4), dtype=np.float64)
 
-    def update(self, pred: np.ndarray, wrf: np.ndarray, ext_quantile: float):
-        # pred (B,6,H,W); wrf (B,2,H,W). Extreme mask is per-pixel (shared by u,v), from
-        # wind magnitude vs this sample's ext_quantile percentile.
+    def update(self, pred: np.ndarray, wrf: np.ndarray, ext_top_frac: float):
+        # pred (B,6,H,W); wrf (B,2,H,W). Extreme mask is per-pixel (shared by u,v): the
+        # windiest ext_top_frac of THIS sample's pixels by wind speed.
         B = pred.shape[0]
         self.n_samples += B
-        mag = np.sqrt(wrf[:, 0] ** 2 + wrf[:, 1] ** 2)                       # (B,H,W)
-        thr = np.quantile(mag.reshape(B, -1), ext_quantile, axis=1)         # (B,)
-        ext = mag >= thr[:, None, None]                                     # (B,H,W)
+        ext = top_speed_mask(wrf, ext_top_frac)[:, 0]                        # (B,H,W)
 
         q = {name: pred[:, sl] for name, _nom, sl in QUANTILES}            # each (B,2,H,W)
         for qi, (name, _nom, _sl) in enumerate(QUANTILES):
@@ -108,7 +107,7 @@ class CalibrationAccumulator:
         return overall, ext
 
 
-def plot_pit(pit_overall: np.ndarray, pit_ext: np.ndarray, ext_quantile: float, output: Path) -> None:
+def plot_pit(pit_overall: np.ndarray, pit_ext: np.ndarray, ext_top_pct: float, output: Path) -> None:
     fig, axes = plt.subplots(1, len(COMPONENTS), figsize=(6.0 * len(COMPONENTS), 4.5), squeeze=False)
     x = np.arange(4)
     w = 0.38
@@ -116,7 +115,7 @@ def plot_pit(pit_overall: np.ndarray, pit_ext: np.ndarray, ext_quantile: float, 
         ax = axes[0, ci]
         ax.bar(x - w / 2, pit_overall[ci], width=w, color="C0", label="overall")
         ax.bar(x + w / 2, pit_ext[ci], width=w, color="C3", alpha=0.85,
-               label=f"extreme tail (|wind| > p{int(ext_quantile * 100)})")
+               label=f"extreme tail (windiest {ext_top_pct:g}% of pixels)")
         # Nominal rates as a step reference.
         ax.step(np.concatenate([x - 0.5, [x[-1] + 0.5]]), np.concatenate([PIT_NOMINAL, [PIT_NOMINAL[-1]]]),
                 where="post", color="black", linewidth=1.5, label="nominal")
@@ -164,7 +163,8 @@ def main() -> None:
         samples="all",
     )
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--ext_quantile", type=float, default=0.9, help="Wind-magnitude percentile defining the 'extreme tail'")
+    parser.add_argument("--ext_top_pct", type=float, default=10.0,
+                        help="Extreme tail = the windiest N%% of each sample's pixels (by wind speed)")
     parser.add_argument("--cov_spread", type=float, default=0.15, help="+/- range of the coverage-deviation color scale")
     parser.add_argument("--pit_output", type=Path, default=None, help="Defaults to <log_dir>/figures/quantile_pit_histogram.png")
     parser.add_argument("--cov_output", type=Path, default=None, help="Defaults to <log_dir>/figures/quantile_coverage_maps.png")
@@ -186,14 +186,14 @@ def main() -> None:
     # ~1 GB, and this diagnostic only ever needs running sums of it.
     for batch_idx, pred in iter_predictions(ev, idx, batch_size=args.batch_size):
         wrf_b = np.array(wrf[batch_idx], dtype=np.float32, copy=True)
-        acc.update(pred, wrf_b, args.ext_quantile)
+        acc.update(pred, wrf_b, args.ext_top_pct / 100.0)
 
     cov_maps = acc.coverage_maps()
     pit_overall, pit_ext = acc.pit_fractions()
 
     lsm_wrf = ev.arrays.wrf_land_mask()
 
-    plot_pit(pit_overall, pit_ext, args.ext_quantile, pit_output)
+    plot_pit(pit_overall, pit_ext, args.ext_top_pct, pit_output)
     plot_coverage_maps(cov_maps, lsm_wrf, args.cov_spread, cov_output)
 
     # ── printed summary ──
